@@ -23,6 +23,7 @@ test('parseCodexRateLimits: drops an already-reset window, returns null when non
   const r = parseCodexRateLimits([line], now);
   assert.equal(r.fiveHourPct, null);
   assert.equal(r.weeklyPct, null);
+  assert.equal(r.resetsAt, null);
 });
 
 test('parseCodexRateLimits: no rate_limits anywhere → null', () => {
