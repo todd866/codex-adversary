@@ -252,3 +252,33 @@ function fiveHourResetNote(fiveHourResetsAt, nowMs) {
   const h = Math.floor(minsUntil / 60), m = minsUntil % 60;
   return `, resets in ${h > 0 ? h + 'h ' : ''}${m}m`;
 }
+
+/**
+ * pickClaudeWindows — carry-forward on transient fetch failure.
+ *
+ * Returns:
+ *   - freshWin if it is non-null (the fetch succeeded; use it).
+ *   - A window-subset from prevState.claude if freshWin is null, prevState has a
+ *     numeric weeklyPct, and prevState.generatedAt is within maxStaleMs of nowMs.
+ *   - null otherwise.
+ *
+ * Pure, never throws.
+ */
+export function pickClaudeWindows(freshWin, prevState, nowMs, maxStaleMs = 15 * 60 * 1000) {
+  try {
+    if (freshWin != null) return freshWin;
+    const c = prevState?.claude;
+    if (typeof c?.weeklyPct !== 'number') return null;
+    const t = Date.parse(prevState?.generatedAt);
+    if (Number.isNaN(t)) return null;
+    if (nowMs - t >= maxStaleMs) return null;
+    return {
+      fiveHourPct:      c.fiveHourPct      ?? null,
+      weeklyPct:        c.weeklyPct,
+      fiveHourResetsAt: c.fiveHourResetsAt ?? null,
+      weeklyResetsAt:   c.weeklyResetsAt   ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
