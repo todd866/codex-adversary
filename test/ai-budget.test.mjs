@@ -12,6 +12,9 @@ test('parseCodexRateLimits: remaining = 100 - used_percent, weekly resetsAt', ()
   assert.equal(r.fiveHourPct, 99);
   assert.equal(r.weeklyPct, 81);
   assert.equal(r.resetsAt, 1782358258);
+  // NEW: both reset times exposed
+  assert.equal(r.fiveHourResetsAt, 1782314385);
+  assert.equal(r.weeklyResetsAt, 1782358258);
 });
 
 test('parseCodexRateLimits: drops an already-reset window, returns null when none usable', () => {
@@ -24,6 +27,9 @@ test('parseCodexRateLimits: drops an already-reset window, returns null when non
   assert.equal(r.fiveHourPct, null);
   assert.equal(r.weeklyPct, null);
   assert.equal(r.resetsAt, null);
+  // NEW: both reset times null when already elapsed
+  assert.equal(r.fiveHourResetsAt, null);
+  assert.equal(r.weeklyResetsAt, null);
 });
 
 test('parseCodexRateLimits: no rate_limits anywhere → null', () => {
@@ -62,6 +68,9 @@ test('parseClaudeUsageWindows: fraction utilization + ISO reset', () => {
   assert.equal(r.fiveHourPct, 62);
   assert.equal(r.weeklyPct, 18);
   assert.equal(r.resetsAt, Math.floor(Date.parse('2026-06-25T13:30:00Z') / 1000));
+  // NEW: both reset times exposed
+  assert.equal(r.fiveHourResetsAt, Math.floor(Date.parse('2026-06-24T13:30:00Z') / 1000));
+  assert.equal(r.weeklyResetsAt, Math.floor(Date.parse('2026-06-25T13:30:00Z') / 1000));
 });
 
 test('parseClaudeUsageWindows: percent utilization + epoch reset, missing windows → null', () => {
@@ -70,16 +79,31 @@ test('parseClaudeUsageWindows: percent utilization + epoch reset, missing window
   assert.equal(r.fiveHourPct, 60);
   assert.equal(r.weeklyPct, null);
   assert.equal(r.resetsAt, null);
+  // NEW: fiveHourResetsAt populated, weeklyResetsAt null when window missing
+  assert.equal(r.fiveHourResetsAt, 1782314385);
+  assert.equal(r.weeklyResetsAt, null);
 });
 
 import { lowestPct, formatSnapshot, formatIfBelow } from '../bin/ai-budget-lib.mjs';
 
+// STATE: Claude weekly low (18%), Codex weekly healthy (81%). Both weekly resets far away (~12h).
+// fiveHourResetsAt/weeklyResetsAt reflect the new parser output stored by refresh.
 const STATE = {
   generatedAt: '2026-06-24T12:00:00Z',
-  claude: { fiveHourPct: 62, weeklyPct: 18, resetsAt: 1782358258, spentToday: 4100000, spent7d: 22000000 },
-  codex:  { fiveHourPct: 99, weeklyPct: 81, resetsAt: 1782358258, spentToday: 0, spent7d: 2900000 },
+  claude: {
+    fiveHourPct: 62, weeklyPct: 18,
+    fiveHourResetsAt: 1782314385, weeklyResetsAt: 1782358258,
+    resetsAt: 1782358258,
+    spentToday: 4100000, spent7d: 22000000,
+  },
+  codex: {
+    fiveHourPct: 99, weeklyPct: 81,
+    fiveHourResetsAt: 1782314385, weeklyResetsAt: 1782358258,
+    resetsAt: 1782358258,
+    spentToday: 0, spent7d: 2900000,
+  },
 };
-const now = Date.parse('2026-06-24T12:00:40Z'); // 40s later
+const now = Date.parse('2026-06-24T12:00:40Z'); // 40s later — both resets ~12h away
 
 test('lowestPct picks the smallest window', () => {
   assert.equal(lowestPct(STATE), 18);
@@ -91,16 +115,122 @@ test('formatSnapshot mentions both providers and the age', () => {
   assert.match(s, /18%/); assert.match(s, /as of/);
 });
 
-test('formatIfBelow: silent when all >= pct, speaks + hints when below', () => {
-  assert.equal(formatIfBelow(STATE, 10, now), '');           // 18 >= 10 → silent
-  const s = formatIfBelow(STATE, 30, now);                    // 18 < 30 → speak
-  assert.match(s, /Claude weekly low|18%/);
-  assert.match(s, /Claude is the constraint/);                // the imbalance hint branch actually fired
+test('formatIfBelow: weekly low + far from reset → frugal hint fires (baseline)', () => {
+  assert.equal(formatIfBelow(STATE, 10, now), '');  // 18 >= 10 → silent
+  const s = formatIfBelow(STATE, 30, now);           // Claude weekly 18 < 30, Codex weekly 81 → imbalance hint
+  assert.match(s, /Claude is the constraint/);
+  // Must NOT suggest frugality when Claude is the only constrained party
+  assert.match(s, /route heavy|parallel|Codex/i);
 });
 
 test('formatSnapshot flags stale state', () => {
   const stale = Date.parse('2026-06-24T12:20:00Z');           // 20 min later
   assert.match(formatSnapshot(STATE, stale), /stale/i);
+});
+
+// ── New scenario tests ────────────────────────────────────────────────────────
+
+// 1. Weekly healthy + 5h low resetting soon → NO frugal language, neutral 5h note allowed
+test('formatIfBelow: weekly healthy, 5h low resetting in 45min → no frugal/conserve language', () => {
+  // nowMs set so 5h reset is 45 minutes away
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const fiveHourResetsAt = Math.floor(base / 1000) + 45 * 60; // 45 min from now
+  const weeklyResetsAt   = Math.floor(base / 1000) + 5 * 24 * 3600; // 5 days away
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: 25, weeklyPct: 69, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+    codex:  { fiveHourPct: 99, weeklyPct: 81, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+  };
+  const out = formatIfBelow(state, 30, base);
+  // Must NOT contain frugal/conserve language
+  assert.doesNotMatch(out, /be deliberate|conserve|route heavy|parallel.*Codex|Codex.*budget|constraint/i,
+    'should not warn to conserve when weekly is healthy');
+});
+
+// 2. Weekly low + far from reset + Codex weekly healthy → frugal + Codex-offload fires
+test('formatIfBelow: weekly low (14%), far from reset + Codex healthy → frugal + offload hint', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const weeklyResetsAt = Math.floor(base / 1000) + 5 * 24 * 3600; // 5d away
+  const fiveHourResetsAt = Math.floor(base / 1000) + 3 * 3600;
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: 90, weeklyPct: 14, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+    codex:  { fiveHourPct: 99, weeklyPct: 72, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+  };
+  const out = formatIfBelow(state, 30, base);
+  assert.match(out, /Claude is the constraint/i);
+  assert.match(out, /Codex/);
+});
+
+// 3. Weekly low + resets in 25min → use-it-or-lose-it, NO frugal hint
+test('formatIfBelow: weekly low (12%) but resets in 25min → no frugal hint (use-it-or-lose-it)', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const weeklyResetsAt = Math.floor(base / 1000) + 25 * 60; // 25 min away — within RESET_SOON_MIN
+  const fiveHourResetsAt = Math.floor(base / 1000) + 2 * 3600;
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: 80, weeklyPct: 12, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+    codex:  { fiveHourPct: 99, weeklyPct: 88, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+  };
+  const out = formatIfBelow(state, 30, base);
+  assert.doesNotMatch(out, /be deliberate|conserve|route heavy|Codex.*budget|constraint/i,
+    'should not frugal-warn when weekly is about to reset');
+});
+
+// 4. 5h low (8%) far from reset + weekly healthy → NO frugal hint (5h never triggers it)
+test('formatIfBelow: 5h low (8%) far from reset, weekly healthy → no frugal hint', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const fiveHourResetsAt = Math.floor(base / 1000) + 4 * 3600; // 4h away
+  const weeklyResetsAt   = Math.floor(base / 1000) + 5 * 24 * 3600;
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: 8, weeklyPct: 75, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+    codex:  { fiveHourPct: 99, weeklyPct: 88, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+  };
+  const out = formatIfBelow(state, 30, base);
+  // The 5h window is below threshold but should not trigger frugal language
+  assert.doesNotMatch(out, /be deliberate|conserve|route heavy|Codex.*budget|Claude is the constraint/i,
+    '5h window low should never trigger frugal language');
+});
+
+// 5. null reset times / missing windows → no throw; low weekly with null reset still conserves
+test('formatIfBelow: null weeklyResetsAt → conserves (fail-safe)', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: 80, weeklyPct: 14, fiveHourResetsAt: null, weeklyResetsAt: null, resetsAt: null, spentToday: 0, spent7d: 0 },
+    codex:  { fiveHourPct: 99, weeklyPct: 72, fiveHourResetsAt: null, weeklyResetsAt: null, resetsAt: null, spentToday: 0, spent7d: 0 },
+  };
+  let out;
+  assert.doesNotThrow(() => { out = formatIfBelow(state, 30, base); });
+  // null reset → not "resetting soon" → weekly low 14 < 30 → frugal hint should fire
+  assert.match(out, /Claude is the constraint/i);
+});
+
+// 5b. Missing windows entirely → no throw, returns ''
+test('formatIfBelow: missing windows entirely → no throw, returns empty', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: null, weeklyPct: null, fiveHourResetsAt: null, weeklyResetsAt: null, resetsAt: null, spentToday: 0, spent7d: 0 },
+    codex:  null,
+  };
+  let out;
+  assert.doesNotThrow(() => { out = formatIfBelow(state, 30, base); });
+  assert.equal(out, '');
+});
+
+// 6. Everything healthy → returns ''
+test('formatIfBelow: everything healthy → empty string', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const weeklyResetsAt = Math.floor(base / 1000) + 5 * 24 * 3600;
+  const fiveHourResetsAt = Math.floor(base / 1000) + 3 * 3600;
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: 75, weeklyPct: 65, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+    codex:  { fiveHourPct: 90, weeklyPct: 88, fiveHourResetsAt, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: 0, spent7d: 0 },
+  };
+  assert.equal(formatIfBelow(state, 30, base), '');
 });
 
 import { writeFileSync, mkdtempSync } from 'node:fs';

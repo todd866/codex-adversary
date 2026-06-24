@@ -25,12 +25,16 @@ export function parseCodexRateLimits(lines, nowEpoch) {
     if (found) rl = found;
   }
   if (!rl) return null;
-  const weeklyReset = rl.secondary && typeof rl.secondary.resets_at === 'number'
+  const fiveHourResetsAt = rl.primary && typeof rl.primary.resets_at === 'number'
+    && rl.primary.resets_at > nowEpoch ? rl.primary.resets_at : null;
+  const weeklyResetsAt = rl.secondary && typeof rl.secondary.resets_at === 'number'
     && rl.secondary.resets_at > nowEpoch ? rl.secondary.resets_at : null;
   return {
     fiveHourPct: windowRemaining(rl.primary, nowEpoch),
     weeklyPct: windowRemaining(rl.secondary, nowEpoch),
-    resetsAt: weeklyReset,
+    fiveHourResetsAt,
+    weeklyResetsAt,
+    resetsAt: weeklyResetsAt,   // back-compat alias
   };
 }
 
@@ -73,10 +77,14 @@ function toEpoch(v) {
 export function parseClaudeUsageWindows(usage, nowEpoch) {
   const fh = usage?.five_hour, wk = usage?.seven_day;
   const reset = (w) => { const e = toEpoch(w?.resets_at); return e !== null && e > nowEpoch ? e : null; };
+  const fiveHourResetsAt = reset(fh);
+  const weeklyResetsAt = reset(wk);
   return {
     fiveHourPct: pctRemaining(fh),
     weeklyPct: pctRemaining(wk),
-    resetsAt: reset(wk),
+    fiveHourResetsAt,
+    weeklyResetsAt,
+    resetsAt: weeklyResetsAt,   // back-compat alias
   };
 }
 
@@ -111,20 +119,63 @@ export function formatSnapshot(state, nowMs) {
   return [providerLine('Claude', state?.claude), providerLine('Codex', state?.codex), `(${label}${stale})`].join('\n');
 }
 
+const RESET_SOON_MIN = 90; // minutes
+
+function resetsSoon(resetEpoch, nowMs) {
+  if (resetEpoch == null) return false;
+  return (resetEpoch * 1000 - nowMs) < RESET_SOON_MIN * 60000;
+}
+
 export function formatIfBelow(state, threshold, nowMs) {
-  const low = lowestPct(state);
-  if (low == null || low >= threshold) return '';
-  const lines = [`⚠ token budget low (${low}% on the tightest window):`,
-    providerLine('Claude', state?.claude), providerLine('Codex', state?.codex)];
+  const nowEpoch = nowMs / 1000;
   const c = state?.claude, x = state?.codex;
-  const claudeLow = c && Math.min(...allPcts(c).concat(101)) < threshold;
-  const codexHigh = x && Math.min(...allPcts(x).concat(101)) >= 50;
-  if (claudeLow && codexHigh) {
-    lines.push('→ Claude is the constraint; Codex has idle budget. Prefer routing heavy/parallel '
-      + 'work to Codex and stay lean. Be deliberate before any big token spend.');
-  } else {
-    lines.push('→ Be deliberate before any big token spend; consider lower effort / batching.');
+
+  // Determine per-provider weekly state
+  const claudeWeeklyPct = c?.weeklyPct ?? null;
+  const claudeWeeklyReset = c?.weeklyResetsAt ?? null;
+  const claudeWeeklyLow = claudeWeeklyPct != null && claudeWeeklyPct < threshold;
+  const claudeWeeklyResetSoon = resetsSoon(claudeWeeklyReset, nowMs);
+
+  const codexWeeklyPct = x?.weeklyPct ?? null;
+  const codexWeeklyHealthy = codexWeeklyPct != null && codexWeeklyPct >= 50;
+
+  // The frugal/offload hint fires ONLY on the WEEKLY window, and ONLY when it is low
+  // AND not resetting soon (use-it-or-lose-it otherwise).
+  const shouldWarnWeekly = claudeWeeklyLow && !claudeWeeklyResetSoon;
+
+  // 5h window neutral note: show when 5h is below threshold but weekly is NOT triggering a warn
+  // (ie weekly is healthy or resetting soon).
+  const claudeFiveHourPct = c?.fiveHourPct ?? null;
+  const claudeFiveHourReset = c?.fiveHourResetsAt ?? null;
+  const fiveHourLow = claudeFiveHourPct != null && claudeFiveHourPct < threshold;
+
+  // If nothing to say, return ''
+  if (!shouldWarnWeekly && !fiveHourLow) return '';
+
+  const lines = [];
+
+  if (shouldWarnWeekly) {
+    lines.push(`⚠ Claude weekly budget low (${claudeWeeklyPct}%):`,
+      providerLine('Claude', c), providerLine('Codex', x));
+    if (codexWeeklyHealthy) {
+      lines.push('→ Claude is the constraint; Codex has idle budget. Prefer routing heavy/parallel '
+        + 'work to Codex and stay lean. Be deliberate before any big token spend.');
+    } else {
+      lines.push('→ Be deliberate before any big token spend; consider lower effort / batching.');
+    }
+  } else if (fiveHourLow) {
+    // Weekly is healthy (or resetting soon): 5h is just a throttle, emit neutral note only
+    let resetNote = '';
+    if (claudeFiveHourReset != null) {
+      const minsUntil = Math.round((claudeFiveHourReset * 1000 - nowMs) / 60000);
+      if (minsUntil > 0) {
+        const h = Math.floor(minsUntil / 60), m = minsUntil % 60;
+        resetNote = ` until it resets in ${h > 0 ? h + 'h ' : ''}${m}m`;
+      }
+    }
+    lines.push(`↻ 5h window low (${claudeFiveHourPct}%); you may be throttled${resetNote} — it doesn't bank, so spend freely.`);
   }
+
   const { label } = ageStr(state?.generatedAt, nowMs);
   lines.push(`(${label})`);
   return lines.join('\n');

@@ -68,7 +68,9 @@ async function refresh() {
     claude: (!claudeWin && tlines.length === 0) ? null : {
       fiveHourPct: claudeWin?.fiveHourPct ?? null,
       weeklyPct: claudeWin?.weeklyPct ?? null,
-      resetsAt: claudeWin?.resetsAt ?? null,
+      fiveHourResetsAt: claudeWin?.fiveHourResetsAt ?? null,
+      weeklyResetsAt: claudeWin?.weeklyResetsAt ?? null,
+      resetsAt: claudeWin?.weeklyResetsAt ?? null,   // back-compat alias
       spentToday: claudeSpend.todayUncached, spent7d: claudeSpend.sevenDayUncached,
     },
     codex: codexRL ? { ...codexRL, spentToday: null, spent7d: null } : null,
