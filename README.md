@@ -132,18 +132,22 @@ proceeds with its own review, noting Codex was unavailable — the pass is never
   reviewed only partially; the wrapper warns above ~400 KB but does not split. Chunk big
   inputs (a manuscript by section, a diff by file).
 - **No code execution.** Codex reads; it does not run your tests or reproduce a bug.
-- **Version-coupled.** The wrapper depends on `codex exec` flags (`--output-last-message`,
-  `--ephemeral`, `--ignore-rules`, `--skip-git-repo-check`). Tested on 0.139.0; a future Codex
-  that renames a flag would break it.
+- **Version-coupled (handled).** The wrapper depends on `codex exec` flags. It preflights
+  `codex exec --help` and **auto-drops hardening flags your build lacks**; a missing
+  `codex exec` or `--output-last-message` fails with a clear **exit 6** instead of silently.
+  Run `codex-adversary.sh --doctor` to check, and see [MAINTENANCE.md](MAINTENANCE.md) for the
+  full compatibility map. Tested on Codex CLI 0.139.0.
 
 ## Troubleshooting
 
-- **"Codex exited non-zero / no output" (exit 4):** usually not logged in — run `codex login`
-  and confirm `codex exec --help` works.
+- **First, run `codex-adversary.sh --doctor`** — it reports your Codex version, whether
+  `codex exec` works, and which required flags are present.
+- **"Codex exited non-zero / no output" (exit 4):** usually not logged in — run `codex login`.
 - **"timed out" (exit 5):** raise `--timeout` (default 600s), or the artifact is too large.
-- **A flag is rejected:** your Codex version may differ from 0.139.0; check `codex exec --help`.
+- **"incompatible" (exit 6):** your Codex lacks `codex exec` or `--output-last-message` —
+  update Codex (see [MAINTENANCE.md](MAINTENANCE.md)).
 
-Exit codes: `0` ran · `2` usage error · `3` Codex not installed · `4` Codex failed/empty · `5` timed out.
+Exit codes: `0` ran · `2` usage · `3` not installed · `4` failed/empty · `5` timed out · `6` incompatible.
 
 ## Uninstall
 

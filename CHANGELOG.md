@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.0 — 2026-06-24
+
+Resilience to Codex CLI version drift, instead of silently breaking when a flag changes.
+
+- Preflight parses `codex exec --help`: hardening flags the installed build lacks
+  (`--ephemeral`, `--ignore-rules`, `--skip-git-repo-check`) are dropped with a note; a
+  missing `codex exec` or `--output-last-message` fails with a clear **exit 6** pointing at
+  MAINTENANCE.md, not an opaque "Codex failed".
+- New **`--doctor`**: reports Codex version, `codex exec` availability, and per-flag
+  compatibility.
+- New **MAINTENANCE.md** mapping every Codex-surface dependency, its failure mode, and the
+  fix (including a `--json` capture fallback to implement if `--output-last-message` is ever
+  removed).
+- Tests cover version-drift adaptation and `--doctor` (28 checks total).
+
 ## v0.2.1 — 2026-06-24
 
 Sharper review prompts so Codex pushes back on **logic/correctness**, not style. The

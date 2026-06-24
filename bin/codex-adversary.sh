@@ -42,6 +42,7 @@
 #                            read-only context. Default: current directory.
 #   --model  NAME            Override Codex model. Default: inherit ~/.codex config.
 #   --timeout SECS           Hard cap on the Codex call. Default: 600.
+#   --doctor                 Check Codex availability + flag compatibility, then exit.
 #   -h|--help                Show this help.
 #
 # EXIT CODES
@@ -50,6 +51,7 @@
 #   3  Codex CLI not found.
 #   4  Codex failed / produced no output (auth, crash, empty) — see stderr.
 #   5  Codex timed out before producing output — see stderr.
+#   6  Codex CLI incompatible (no 'codex exec' or no --output-last-message) — see stderr.
 #
 set -uo pipefail
 
@@ -62,11 +64,32 @@ REPO="$(pwd)"
 REPO_EXPLICIT=0
 MODEL=""
 TIMEOUT="600"
+DOCTOR=0
 
 die_usage() { echo "codex-adversary.sh: $1" >&2; echo "Run with --help for usage." >&2; exit 2; }
 # need_val CURRENT_ARGC FLAG — guard a `shift 2` so a value-less flag (e.g. a
 # trailing `--mode`) errors instead of looping forever (no `set -e` here).
 need_val() { [ "$1" -ge 2 ] || die_usage "$2 requires a value"; }
+
+# --doctor: report Codex availability + which flags this wrapper needs are present.
+doctor() {
+  echo "codex-adversary doctor:"
+  if command -v codex >/dev/null 2>&1; then
+    echo "  codex:      $(codex --version 2>/dev/null | head -1)  ($(command -v codex))"
+  else
+    echo "  codex:      NOT FOUND on PATH — install: https://github.com/openai/codex"; return 3
+  fi
+  local help; help="$(codex exec --help 2>/dev/null || true)"
+  [ -n "$help" ] || { echo "  codex exec: UNAVAILABLE ('codex exec --help' failed)"; return 6; }
+  echo "  codex exec: ok"
+  local f miss=0
+  for f in --output-last-message --sandbox --ephemeral --ignore-rules --skip-git-repo-check -c; do
+    if printf '%s' "$help" | grep -q -- "$f"; then echo "  flag $f: present"
+    else echo "  flag $f: MISSING"; [ "$f" = "--output-last-message" ] && miss=1; fi
+  done
+  [ "$miss" = "0" ] || { echo "  => INCOMPATIBLE: --output-last-message is required (see MAINTENANCE.md)"; return 6; }
+  echo "  => compatible. (Auth not checked here — run a real review to confirm 'codex login'.)"
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -78,10 +101,13 @@ while [ $# -gt 0 ]; do
     --repo)    need_val "$#" "$1"; REPO="$2"; REPO_EXPLICIT=1; shift 2 ;;
     --model)   need_val "$#" "$1"; MODEL="$2"; shift 2 ;;
     --timeout) need_val "$#" "$1"; TIMEOUT="$2"; shift 2 ;;
+    --doctor)  DOCTOR=1; shift ;;
     -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
     *) die_usage "unknown option: $1" ;;
   esac
 done
+
+[ "$DOCTOR" = "1" ] && { doctor; exit $?; }
 
 case "$TIMEOUT" in (*[!0-9]*|'') die_usage "--timeout must be a positive integer (seconds): $TIMEOUT" ;; esac
 [ "$TIMEOUT" -ge 1 ] || die_usage "--timeout must be at least 1 second: $TIMEOUT"
@@ -90,6 +116,14 @@ case "$MODE" in prose|diff|advise) ;; *) die_usage "--mode must be prose, diff, 
 case "$EFFORT" in low|medium|high|xhigh) ;; *) die_usage "--effort must be low|medium|high|xhigh" ;; esac
 
 command -v codex >/dev/null 2>&1 || { echo "codex-adversary.sh: codex CLI not found on PATH" >&2; exit 3; }
+
+# Adapt to the installed Codex CLI: parse `codex exec --help` once so we can drop
+# hardening flags this build lacks (graceful) and fail CLEARLY if the essential
+# capture flag is gone — instead of an opaque "Codex failed" on version drift.
+CODEX_HELP="$(codex exec --help 2>/dev/null || true)"
+[ -n "$CODEX_HELP" ] || { echo "codex-adversary.sh: 'codex exec' is unavailable in your Codex CLI ('codex exec --help' failed). This wrapper needs the 'codex exec' subcommand — update Codex, or see MAINTENANCE.md." >&2; exit 6; }
+codex_supports() { printf '%s' "$CODEX_HELP" | grep -q -- "$1"; }
+codex_supports "--output-last-message" || { echo "codex-adversary.sh: your Codex CLI lacks 'codex exec --output-last-message', which this wrapper needs for clean capture. Update Codex, or add a --json fallback (see MAINTENANCE.md)." >&2; exit 6; }
 
 # --- portable timeout -----------------------------------------------------------
 # Args: SECS INFILE -- cmd...   INFILE is fed as stdin via an EXPLICIT redirect
@@ -146,15 +180,19 @@ CODE_FRAMING='You are an adversarial code reviewer — a skeptical senior engine
 ADVISE_FRAMING='You are a senior technical advisor giving a SECOND OPINION on a decision someone faces mid-task, BEFORE they act. They — not you — will decide and act; you cannot make changes. From the situation and any context below: (1) restate the decision as you understand it, in one line; (2) lay out the main viable options; (3) the key tradeoffs and the risks or edge-cases they are most likely missing; (4) a concrete recommended approach, with your reasoning; (5) call out anything that would make their apparent current plan a mistake. Be specific and decisive — surface considerations a single perspective would miss rather than hedging everything. Focus on what could make the plan wrong or costly; ignore cosmetic preferences. If the situation is underspecified, state the assumption your advice depends on instead of refusing to answer.'
 
 build_codex_cmd() {
-  #   --output-last-message : capture ONLY Codex's final answer (clean stdout)
-  #   --ephemeral           : don't persist the prompt/diff to ~/.codex session logs
-  #   --ignore-rules        : don't load project rule files (an untrusted repo's
-  #                           AGENTS.md etc. could carry instructions to the reviewer)
-  #   --skip-git-repo-check : prose reads nothing from disk and may run outside a
-  #                           git repo; recent Codex refuses to start otherwise
-  # shellcheck disable=SC2206
-  CODEX_CMD=(codex exec --sandbox read-only --ephemeral --ignore-rules --skip-git-repo-check
-             -c model_reasoning_effort="$EFFORT" --output-last-message "$OUT_FILE")
+  # Essential (preflighted): read-only sandbox + clean capture via --output-last-message.
+  CODEX_CMD=(codex exec --sandbox read-only)
+  # Hardening flags — include only those THIS Codex build advertises, dropping any it
+  # lacks (with a note) so a renamed/removed flag degrades gracefully instead of erroring:
+  #   --ephemeral           don't persist the prompt to ~/.codex session logs
+  #   --ignore-rules        don't load an untrusted repo's rule files (AGENTS.md etc.)
+  #   --skip-git-repo-check let prose run outside a git repo (rooted in a temp dir)
+  local f
+  for f in --ephemeral --ignore-rules --skip-git-repo-check; do
+    if codex_supports "$f"; then CODEX_CMD+=("$f")
+    else echo "codex-adversary.sh: note — this Codex build lacks $f; proceeding without it." >&2; fi
+  done
+  CODEX_CMD+=(-c model_reasoning_effort="$EFFORT" --output-last-message "$OUT_FILE")
   [ -n "$MODEL" ] && CODEX_CMD+=(-m "$MODEL")
 }
 

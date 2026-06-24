@@ -19,6 +19,17 @@ contains()    { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "
 STUBDIR="$WORK/stubbin"; mkdir -p "$STUBDIR"
 cat > "$STUBDIR/codex" <<'STUB'
 #!/usr/bin/env bash
+# fake codex. STUB_FLAGS = flags to advertise in `codex exec --help` (default: all the
+# wrapper wants); set it to fewer to simulate an older/newer Codex. STUB_MODE = ok|fail|empty|hang.
+case " $* " in
+  *" --version "*) echo "codex-stub 0.0.0"; exit 0 ;;
+  *" --help "*)
+    echo "Usage: codex exec [OPTIONS]"
+    for f in ${STUB_FLAGS:---output-last-message --sandbox --ephemeral --ignore-rules --skip-git-repo-check -c -m -C}; do
+      echo "  $f"
+    done
+    exit 0 ;;
+esac
 out=""; prev=""
 for a in "$@"; do [ "$prev" = "--output-last-message" ] && out="$a"; prev="$a"; done
 input="$(cat)"
@@ -77,6 +88,18 @@ echo "== codex failure / timeout =="
 printf 'x' | STUB_MODE=fail  "$WRAP" --mode prose >/dev/null 2>&1;             expect_exit "codex non-zero -> 4" 4 $?
 printf 'x' | STUB_MODE=empty "$WRAP" --mode prose >/dev/null 2>&1;             expect_exit "codex empty   -> 4" 4 $?
 printf 'x' | STUB_MODE=hang  "$WRAP" --mode prose --timeout 1 >/dev/null 2>&1; expect_exit "timeout      -> 5" 5 $?
+
+echo "== version-drift adaptation =="
+printf x | STUB_FLAGS='--output-last-message --sandbox --ignore-rules --skip-git-repo-check' "$WRAP" --mode prose --effort low >/dev/null 2>"$WORK/e1"; rc=$?
+expect_exit "missing hardening flag still runs" 0 "$rc"
+contains "$(cat "$WORK/e1")" "lacks --ephemeral" "warns about the dropped flag"
+printf x | STUB_FLAGS='--sandbox --ephemeral' "$WRAP" --mode prose >/dev/null 2>"$WORK/e2"; rc=$?
+expect_exit "missing --output-last-message -> 6" 6 "$rc"
+contains "$(cat "$WORK/e2")" "output-last-message" "explains the incompatibility"
+
+echo "== doctor =="
+"$WRAP" --doctor >/dev/null 2>&1;                        expect_exit "doctor: compatible -> 0"   0 $?
+STUB_FLAGS='--sandbox' "$WRAP" --doctor >/dev/null 2>&1;  expect_exit "doctor: incompatible -> 6" 6 $?
 
 echo
 echo "passed: $PASS, failed: $FAIL"
