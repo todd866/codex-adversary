@@ -3,7 +3,7 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>com.codex-adversary.ai-budget</string>
   <key>ProgramArguments</key>
-  <array><string>/usr/bin/env</string><string>node</string><string>__BIN__</string><string>refresh</string></array>
+  <array><string>__NODE__</string><string>__BIN__</string><string>refresh</string></array>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Background</string>
