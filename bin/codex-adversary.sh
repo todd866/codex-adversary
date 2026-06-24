@@ -4,11 +4,16 @@
 # adversarial reviewer and print ONLY its findings to stdout.
 #
 # This is the primitive behind the `adversarial-review` skill. Claude calls it
-# alongside its own review agents, then synthesizes both for diversity of thought.
+# alongside its own review agents, then reconciles both — a second model from a
+# different vendor catches errors a single reviewer's blind spots would miss.
 #
-# Codex runs with --sandbox read-only: it can read files and (in diff mode) the
-# repo, but it CANNOT modify anything. Safe to run in any repo, any time,
-# including commit-gated or multi-agent shared trees.
+# SAFETY: --sandbox read-only means Codex cannot WRITE your files. It can still
+# READ them, and the content you review is SENT to your configured Codex/model
+# provider. Do NOT review secrets, patient/regulated data, or embargoed material
+# you cannot share with that provider. The wrapper also passes --ephemeral (don't
+# persist the prompt) and --ignore-rules (don't load an untrusted repo's rule
+# files), but it cannot stop a determined prompt-injection in the reviewed
+# content — treat Codex's output as advice, not ground truth.
 #
 # USAGE
 #   # Prose / argument / claim (content on stdin or via --file):
@@ -20,15 +25,21 @@
 #   codex-adversary.sh --mode diff --effort high              # uncommitted changes
 #   codex-adversary.sh --mode diff --base main --repo /path/to/repo
 #
+#   # Advise — a second opinion on a decision, BEFORE acting (--repo adds context):
+#   echo "<the decision + context>" | codex-adversary.sh --mode advise --repo . \
+#       --focus "Which migration strategy, and what am I missing?"
+#
 # OPTIONS
-#   --mode   prose|diff      What to review. Default: prose.
+#   --mode   prose|diff|advise  prose/diff = adversarial review; advise = counsel on a
+#                            decision before acting. Default: prose.
 #   --effort low|medium|high|xhigh
 #                            Codex reasoning effort. Default: high.
 #                            (Claude picks this per-pass; see the skill's rubric.)
-#   --focus  "..."           Optional extra instruction to steer the critique.
-#   --file   PATH            (prose) Read content from PATH instead of stdin.
+#   --focus  "..."           Optional extra instruction / the specific question.
+#   --file   PATH            (prose/advise) Read content from PATH instead of stdin.
 #   --base   BRANCH          (diff) Review changes vs BRANCH instead of uncommitted.
-#   --repo   DIR             (diff) Repo working dir. Default: current directory.
+#   --repo   DIR             (diff) repo to diff; (advise) codebase given to Codex as
+#                            read-only context. Default: current directory.
 #   --model  NAME            Override Codex model. Default: inherit ~/.codex config.
 #   --timeout SECS           Hard cap on the Codex call. Default: 600.
 #   -h|--help                Show this help.
@@ -48,6 +59,7 @@ FOCUS=""
 FILE=""
 BASE=""
 REPO="$(pwd)"
+REPO_EXPLICIT=0
 MODEL=""
 TIMEOUT="600"
 
@@ -63,7 +75,7 @@ while [ $# -gt 0 ]; do
     --focus)   need_val "$#" "$1"; FOCUS="$2"; shift 2 ;;
     --file)    need_val "$#" "$1"; FILE="$2"; shift 2 ;;
     --base)    need_val "$#" "$1"; BASE="$2"; shift 2 ;;
-    --repo)    need_val "$#" "$1"; REPO="$2"; shift 2 ;;
+    --repo)    need_val "$#" "$1"; REPO="$2"; REPO_EXPLICIT=1; shift 2 ;;
     --model)   need_val "$#" "$1"; MODEL="$2"; shift 2 ;;
     --timeout) need_val "$#" "$1"; TIMEOUT="$2"; shift 2 ;;
     -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
@@ -72,42 +84,55 @@ while [ $# -gt 0 ]; do
 done
 
 case "$TIMEOUT" in (*[!0-9]*|'') die_usage "--timeout must be a positive integer (seconds): $TIMEOUT" ;; esac
+[ "$TIMEOUT" -ge 1 ] || die_usage "--timeout must be at least 1 second: $TIMEOUT"
 
-case "$MODE" in prose|diff) ;; *) die_usage "--mode must be prose or diff" ;; esac
+case "$MODE" in prose|diff|advise) ;; *) die_usage "--mode must be prose, diff, or advise" ;; esac
 case "$EFFORT" in low|medium|high|xhigh) ;; *) die_usage "--effort must be low|medium|high|xhigh" ;; esac
 
 command -v codex >/dev/null 2>&1 || { echo "codex-adversary.sh: codex CLI not found on PATH" >&2; exit 3; }
 
-# --- portable timeout (macOS has no `timeout`) ----------------------------------
-# Args: SECS INFILE -- cmd...   INFILE is fed to the command as stdin via an
-# EXPLICIT redirect (bash sends an async command's stdin to /dev/null otherwise).
+# --- portable timeout -----------------------------------------------------------
+# Args: SECS INFILE -- cmd...   INFILE is fed as stdin via an EXPLICIT redirect
+# (bash sends an async command's stdin to /dev/null otherwise).
 # Returns 124 on timeout (matching GNU `timeout`), else the command's own status.
+# `codex exec` is a Node process that spawns native children, so on timeout we
+# must signal the whole PROCESS GROUP or grandchildren leak. Stock macOS ships
+# neither `timeout` nor `gtimeout`, so the pure-bash group-kill IS the live path.
 run_with_timeout() {
   local secs="$1" infile="$2"; shift 2
-  if command -v timeout  >/dev/null 2>&1; then timeout  "$secs" "$@" < "$infile"; return $?; fi
-  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@" < "$infile"; return $?; fi
-  # Pure-bash fallback. The explicit stdin redirect matters: bash sends an
-  # async command's stdin to /dev/null unless a redirect is present.
+  if command -v timeout  >/dev/null 2>&1; then timeout  -k 5 "$secs" "$@" < "$infile"; return $?; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout -k 5 "$secs" "$@" < "$infile"; return $?; fi
+
   local marker="$TMPDIR_RUN/timed_out"; rm -f "$marker"
-  "$@" < "$infile" & local cmd_pid=$!
+  # Run the child in its own process group so we can kill the whole tree (codex
+  # spawns children). Job control may be unavailable in constrained shells, so
+  # detect whether monitor mode actually engaged and fall back to single-PID.
+  local monitor_was_on=0; case $- in *m*) monitor_was_on=1 ;; esac
+  set -m 2>/dev/null
+  local use_pgrp=0; case $- in *m*) use_pgrp=1 ;; esac
+  "$@" < "$infile" &
+  local cmd_pid=$!
+  local ctarget="$cmd_pid"; [ "$use_pgrp" -eq 1 ] && ctarget="-$cmd_pid"
   (
     sleep "$secs"
     : > "$marker"
-    kill -TERM "$cmd_pid" 2>/dev/null
+    kill -TERM "$ctarget" 2>/dev/null
     sleep 5
-    kill -KILL "$cmd_pid" 2>/dev/null   # escalate if SIGTERM was ignored
-  ) & local watch_pid=$!
+    kill -KILL "$ctarget" 2>/dev/null   # escalate if SIGTERM was ignored
+  ) &
+  local watch_pid=$!
   wait "$cmd_pid" 2>/dev/null; local rc=$?
-  # Tear down the watchdog AND its sleep child so no orphan lingers to wake later.
-  local kid; kid="$(pgrep -P "$watch_pid" 2>/dev/null)"
-  kill "$watch_pid" 2>/dev/null
-  [ -n "$kid" ] && kill $kid 2>/dev/null
+  if [ "$monitor_was_on" -eq 1 ]; then set -m; else set +m; fi   # restore caller's state
+  # Tear down the watchdog (its sleep child included) so nothing lingers.
+  local wtarget="$watch_pid"; [ "$use_pgrp" -eq 1 ] && wtarget="-$watch_pid"
+  kill -TERM "$wtarget" 2>/dev/null
   wait "$watch_pid" 2>/dev/null
   [ -f "$marker" ] && rc=124
   return $rc
 }
 
-TMPDIR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/codex-adversary.XXXXXX")"
+TMPDIR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/codex-adversary.XXXXXX")" || { echo "codex-adversary.sh: failed to create temp dir" >&2; exit 4; }
+[ -n "$TMPDIR_RUN" ] || { echo "codex-adversary.sh: failed to create temp dir" >&2; exit 4; }
 PROMPT_FILE="$TMPDIR_RUN/prompt.txt"
 OUT_FILE="$TMPDIR_RUN/findings.txt"
 LOG_FILE="$TMPDIR_RUN/session.log"
@@ -118,9 +143,18 @@ PROSE_FRAMING='You are an adversarial referee — a skeptical, independent secon
 
 CODE_FRAMING='You are an adversarial code reviewer — a skeptical senior engineer. Review the change below for substantive problems only: correctness bugs, security issues, broken or unhandled edge cases, regressions, race conditions, resource leaks, and violated invariants. You have read-only access to the repository for context — read surrounding files as needed. For each issue: file:line, what is wrong, why it matters, and a concrete fix. Be concrete and skeptical; do NOT praise or restate the diff. If you find nothing substantive, say so plainly rather than inventing nitpicks.'
 
+ADVISE_FRAMING='You are a senior technical advisor giving a SECOND OPINION on a decision someone faces mid-task, BEFORE they act. They — not you — will decide and act; you cannot make changes. From the situation and any context below: (1) restate the decision as you understand it, in one line; (2) lay out the main viable options; (3) the key tradeoffs and the risks or edge-cases they are most likely missing; (4) a concrete recommended approach, with your reasoning; (5) call out anything that would make their apparent current plan a mistake. Be specific and decisive — surface considerations a single perspective would miss rather than hedging everything. If the situation is underspecified, state the assumption your advice depends on instead of refusing to answer.'
+
 build_codex_cmd() {
+  #   --output-last-message : capture ONLY Codex's final answer (clean stdout)
+  #   --ephemeral           : don't persist the prompt/diff to ~/.codex session logs
+  #   --ignore-rules        : don't load project rule files (an untrusted repo's
+  #                           AGENTS.md etc. could carry instructions to the reviewer)
+  #   --skip-git-repo-check : prose reads nothing from disk and may run outside a
+  #                           git repo; recent Codex refuses to start otherwise
   # shellcheck disable=SC2206
-  CODEX_CMD=(codex exec --sandbox read-only -c model_reasoning_effort="$EFFORT" -o "$OUT_FILE")
+  CODEX_CMD=(codex exec --sandbox read-only --ephemeral --ignore-rules --skip-git-repo-check
+             -c model_reasoning_effort="$EFFORT" --output-last-message "$OUT_FILE")
   [ -n "$MODEL" ] && CODEX_CMD+=(-m "$MODEL")
 }
 
@@ -141,21 +175,60 @@ if [ "$MODE" = "prose" ]; then
     printf '\n'
   } > "$PROMPT_FILE"
   build_codex_cmd
+  CODEX_CMD+=(-C "$TMPDIR_RUN")   # prose reads nothing from disk; root Codex in an empty trusted dir
+
+elif [ "$MODE" = "advise" ]; then
+  CONTENT_FILE="$TMPDIR_RUN/content.txt"
+  if [ -n "$FILE" ]; then
+    [ -f "$FILE" ] || die_usage "--file not found: $FILE"
+    cat "$FILE" > "$CONTENT_FILE" || die_usage "could not read --file: $FILE"
+  else
+    cat > "$CONTENT_FILE"   # the decision + context, on stdin
+  fi
+  LC_ALL=C grep -q '[^[:space:]]' "$CONTENT_FILE" || { echo "codex-adversary.sh: no decision/context provided on stdin/--file" >&2; exit 2; }
+  {
+    printf '%s\n' "$ADVISE_FRAMING"
+    [ -n "$FOCUS" ] && printf '\nThe specific question to weigh in on: %s\n' "$FOCUS"
+    printf '\n--- SITUATION / DECISION / CONTEXT ---\n\n'
+    cat "$CONTENT_FILE"
+    printf '\n'
+  } > "$PROMPT_FILE"
+  build_codex_cmd
+  if [ "$REPO_EXPLICIT" = "1" ]; then
+    [ -d "$REPO" ] || die_usage "--repo is not a directory: $REPO"
+    CODEX_CMD+=(-C "$REPO")        # give Codex the codebase as read-only context
+  else
+    CODEX_CMD+=(-C "$TMPDIR_RUN")  # no codebase context requested
+  fi
 
 else  # diff mode
   git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die_usage "--repo is not a git repo: $REPO"
+  # --no-ext-diff / --no-textconv: never run repo-configured external diff or
+  # textconv programs (a hostile local git config could otherwise execute on host).
+  GD=(git -C "$REPO" diff --no-ext-diff --no-textconv)
   if [ -n "$BASE" ]; then
     git -C "$REPO" rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null \
       || die_usage "--base is not a valid git ref in $REPO: $BASE"
-    RAW="$(git -C "$REPO" diff "$BASE"...HEAD 2>/dev/null)"
+    if ! { git -C "$REPO" diff --quiet 2>/dev/null && git -C "$REPO" diff --staged --quiet 2>/dev/null; }; then
+      echo "codex-adversary.sh: note — worktree has uncommitted changes; Codex sees the live files, which may differ from the reviewed ${BASE}...HEAD diff." >&2
+    fi
+    RAW="$("${GD[@]}" "$BASE"...HEAD 2>/dev/null)"
     DIFF_TEXT="$RAW"
     SCOPE="changes on this branch vs base '$BASE'"
   else
-    UNSTAGED="$(git -C "$REPO" diff 2>/dev/null)"
-    STAGED="$(git -C "$REPO" diff --staged 2>/dev/null)"
-    RAW="$UNSTAGED$STAGED"
-    DIFF_TEXT="$(printf '===== UNSTAGED CHANGES (working tree vs index) =====\n%s\n\n===== STAGED CHANGES (index vs HEAD) =====\n%s\n' "$UNSTAGED" "$STAGED")"
-    SCOPE="uncommitted changes (unstaged + staged)"
+    UNSTAGED="$("${GD[@]}" 2>/dev/null)"
+    STAGED="$("${GD[@]}" --staged 2>/dev/null)"
+    # Untracked (new) files are in neither diff; include them as additions so a
+    # review of "uncommitted changes" doesn't silently skip brand-new files.
+    UNTRACKED=""
+    while IFS= read -r -d '' uf; do
+      [ -n "$uf" ] || continue
+      UNTRACKED="$UNTRACKED
+$(git -C "$REPO" diff --no-index --no-color --no-ext-diff --no-textconv -- /dev/null "$uf" 2>/dev/null)"
+    done < <(git -C "$REPO" ls-files -z --others --exclude-standard 2>/dev/null)
+    RAW="$UNSTAGED$STAGED$UNTRACKED"
+    DIFF_TEXT="$(printf '===== UNSTAGED CHANGES (working tree vs index) =====\n%s\n\n===== STAGED CHANGES (index vs HEAD) =====\n%s\n\n===== UNTRACKED (new) FILES =====\n%s\n' "$UNSTAGED" "$STAGED" "$UNTRACKED")"
+    SCOPE="uncommitted changes (unstaged + staged + untracked)"
   fi
   [ -n "${RAW//[$' \t\n\r']/}" ] || { echo "codex-adversary.sh: no $SCOPE to review in $REPO" >&2; exit 2; }
   {
@@ -170,6 +243,10 @@ fi
 
 # --- common: guard the assembled prompt, then run Codex -------------------------
 [ -s "$PROMPT_FILE" ] || { echo "codex-adversary.sh: failed to assemble prompt (empty prompt file)" >&2; exit 4; }
+PROMPT_BYTES=$(wc -c < "$PROMPT_FILE" 2>/dev/null || echo 0)
+if [ "${PROMPT_BYTES:-0}" -gt 400000 ]; then
+  echo "codex-adversary.sh: warning — prompt is ${PROMPT_BYTES} bytes (~$((PROMPT_BYTES/4)) tokens) and may exceed Codex's context window; the review could be partial. Consider splitting (a manuscript by section, a diff by file)." >&2
+fi
 run_with_timeout "$TIMEOUT" "$PROMPT_FILE" "${CODEX_CMD[@]}" - > "$LOG_FILE" 2>&1
 RC=$?
 

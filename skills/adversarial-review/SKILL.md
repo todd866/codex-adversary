@@ -5,10 +5,13 @@ description: Use when doing any substantive adversarial / red-team / referee / "
 
 # Adversarial review with Codex + Claude
 
-An adversarial pass is not "one model's opinion." Run **two independent models** —
-your own Claude review agent(s) **and** Codex (via your local Codex CLI) — then
-**synthesize** them. Two architectures catch different failure modes; agreement is
-signal, disagreement is where the lead (Claude) decides.
+An adversarial pass is not "one model's opinion." Run **two models from different
+vendors** — your own Claude review agent(s) **and** Codex (via your local Codex CLI) —
+then **synthesize** them. They catch different failure modes; agreement raises confidence,
+disagreement is where the lead (Claude) decides. (Both are transformer LLMs trained on
+overlapping data, so their errors are *correlated*: agreement reduces stochastic misses but
+does NOT clear shared blind spots — for anything safety/correctness-critical, add a non-LLM
+check.)
 
 ## The pattern
 
@@ -27,13 +30,18 @@ signal, disagreement is where the lead (Claude) decides.
    ~/.claude/bin/codex-adversary.sh --mode diff --effort <high|xhigh> --repo "$(pwd)"
    ~/.claude/bin/codex-adversary.sh --mode diff --base main           # vs a base branch
    ```
-   Codex is **read-only** — it cannot modify files. Safe in any repo, including
-   commit-gated (md3) or shared multi-agent trees.
+   Codex is **read-only** — it cannot modify files, so it is safe against any working
+   tree. But the reviewed content is **sent to your Codex/model provider**: do not point
+   it at secrets, patient/regulated data, or embargoed material.
 4. **Synthesize** (below). Never just paste Codex's output — reconcile it.
 
 Prefer running step 2 and step 3 concurrently (a Claude agent + a Bash call to
 the wrapper) so the pass doesn't serialize. A clean way is one Workflow with the
 Claude lenses as `agent()` stages and one stage that runs the wrapper via Bash.
+
+Large artifacts: the wrapper warns above ~400 KB but does not chunk. For a big diff or
+manuscript, split it (by file, by section) and run the pass per chunk — otherwise Codex
+may review it only partially, with no error.
 
 ## Choosing Codex effort per-pass (you decide; pass via `--effort`)
 
@@ -79,6 +87,14 @@ findings are inputs you weigh — never capitulate to them, never rubber-stamp t
   decide, move on — don't escalate taste to the human and don't loop on it.
 - **Take something to the human only when** it is material AND you genuinely cannot
   adjudicate it yourself — not merely because the two models disagree.
+- **Asymmetric veto — guard your own blind spots.** If a Codex finding would, *if true*,
+  indicate an error in your OWN prior reasoning or output, do NOT dismiss it on your own
+  authority; that is precisely the case you are least equipped to judge. Verify it with a
+  non-LLM check (run it, grep it, recompute) or put it to the human — regardless of your
+  confidence. Never retire a substantive correctness finding by reclassifying it as "taste."
+- **Weigh the sampling asymmetry.** You run several lenses; Codex runs one pass. So "Codex
+  didn't raise it" is weak evidence, and "both agree" partly reflects a single low-variance
+  sample — don't over-read one Codex pass as a full second opinion.
 - **Beware false consensus.** LLMs capitulate when told the other model disagrees, so the
   rebuttal prompt must say plainly: *do not concede merely to agree; withdraw only if the
   new evidence actually refutes the point.* Weight "held-and-sharpened" over
@@ -90,5 +106,5 @@ findings are inputs you weigh — never capitulate to them, never rubber-stamp t
 
 If the wrapper exits non-zero (Codex missing, unauthed, timeout, empty), **proceed
 with the Claude-only review and state plainly that Codex was unavailable** — never
-block or fail the pass. Exit codes: `3` = codex not installed, `4` = no output
-(auth/timeout), `2` = usage error.
+block or fail the pass. Exit codes: `2` = usage error, `3` = Codex not installed,
+`4` = Codex failed / empty output, `5` = timed out.

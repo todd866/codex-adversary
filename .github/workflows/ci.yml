@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: syntax check
+        run: |
+          for f in bin/codex-adversary.sh install.sh uninstall.sh test/run.sh; do
+            bash -n "$f"
+          done
+      - name: shellcheck
+        run: shellcheck -S warning bin/codex-adversary.sh install.sh uninstall.sh test/run.sh
+      - name: tests
+        run: ./test/run.sh
