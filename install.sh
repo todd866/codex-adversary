@@ -45,6 +45,31 @@ else
   echo "ai-budget: non-macOS or no node — service not installed; readers will show what they can."
 fi
 
+# --- merge ai-budget hooks into settings.json (idempotent, JSON-aware) ---
+node - "$DEST" <<'NODE'
+const fs = require('fs'); const path = require('path');
+const dest = process.argv[2]; const f = path.join(dest, 'settings.json');
+const bin = path.join(dest, 'bin', 'ai-budget.mjs');
+const s = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {};
+s.hooks ||= {};
+const cmd = (args) => `node "${bin}" ${args}`;
+const want = {
+  SessionStart:     { match: null,                  command: cmd('read') },
+  UserPromptSubmit: { match: null,                  command: cmd('if-below 30') },
+  PreToolUse:       { match: 'Workflow|Agent|Task',  command: cmd('if-below 30') },
+};
+for (const [event, { match, command }] of Object.entries(want)) {
+  s.hooks[event] ||= [];
+  const has = JSON.stringify(s.hooks[event]).includes('ai-budget.mjs');
+  if (has) continue;
+  const entry = { hooks: [{ type: 'command', command }] };
+  if (match) entry.matcher = match;
+  s.hooks[event].push(entry);
+}
+fs.writeFileSync(f, JSON.stringify(s, null, 2) + '\n');
+console.log('ai-budget hooks merged into', f);
+NODE
+
 # --- skills: never silently clobber a foreign same-named skill -------------------
 for src_skill in "$SRC"/skills/*/; do
   name="$(basename "$src_skill")"
