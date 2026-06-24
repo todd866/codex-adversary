@@ -58,19 +58,31 @@ if (fs.existsSync(f)) {
 }
 s.hooks ||= {};
 const cmd = (args) => `node "${bin}" ${args}`;
+
+// Desired hooks: SessionStart (once-per-session glance) + PreToolUse for big ops (critical-only).
+// NO UserPromptSubmit ai-budget hook — quiet by default.
 const want = {
-  SessionStart:     { match: null,                  command: cmd('read') },
-  UserPromptSubmit: { match: null,                  command: cmd('if-below 30') },
-  PreToolUse:       { match: 'Workflow|Agent|Task',  command: cmd('if-below 30') },
+  SessionStart: { match: null,                   command: cmd('read') },
+  PreToolUse:   { match: 'Workflow|Agent|Task',  command: cmd('if-below 30') },
 };
+
 for (const [event, { match, command }] of Object.entries(want)) {
   s.hooks[event] ||= [];
-  const has = JSON.stringify(s.hooks[event]).includes('ai-budget.mjs');
-  if (has) continue;
+  const already = s.hooks[event].some(e => JSON.stringify(e).includes('ai-budget.mjs'));
+  if (already) continue;
   const entry = { hooks: [{ type: 'command', command }] };
   if (match) entry.matcher = match;
   s.hooks[event].push(entry);
 }
+
+// Remove any existing UserPromptSubmit ai-budget hook (keep non-ai-budget hooks).
+if (s.hooks.UserPromptSubmit) {
+  s.hooks.UserPromptSubmit = s.hooks.UserPromptSubmit.filter(
+    e => !JSON.stringify(e).includes('ai-budget.mjs')
+  );
+  if (s.hooks.UserPromptSubmit.length === 0) delete s.hooks.UserPromptSubmit;
+}
+
 fs.writeFileSync(f, JSON.stringify(s, null, 2) + '\n');
 console.log('ai-budget hooks merged into', f);
 NODE

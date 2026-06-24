@@ -4,10 +4,28 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseCodexRateLimits, sumClaudeTranscriptTokens, parseClaudeUsageWindows,
-         formatSnapshot, formatIfBelow } from './ai-budget-lib.mjs';
+         formatSnapshot, formatIfBelow, projectWeeklyTrend } from './ai-budget-lib.mjs';
 
 const HOME = homedir();
 const STATE = join(HOME, '.claude', '.cache', 'ai-budget.json');
+const HISTORY = join(HOME, '.claude', '.cache', 'ai-budget-history.json');
+const HISTORY_MAX = 400;
+
+function readHistory() {
+  try {
+    const raw = JSON.parse(readFileSync(HISTORY, 'utf8'));
+    if (!Array.isArray(raw)) return [];
+    return raw;
+  } catch { return []; }
+}
+
+function writeHistory(history) {
+  try {
+    const tmp = HISTORY + '.tmp';
+    writeFileSync(tmp, JSON.stringify(history));
+    renameSync(tmp, HISTORY);
+  } catch { /* never crash refresh */ }
+}
 
 function newestCodexSessionLines() {
   const root = join(HOME, '.codex', 'sessions');
@@ -63,12 +81,33 @@ async function refresh() {
   const tlines = allTranscriptLines();
   const claudeSpend = sumClaudeTranscriptTokens(tlines, nowMs);
   const claudeWin = await claudeWindows(nowEpoch);
+
+  const claudeWeeklyPct = claudeWin?.weeklyPct ?? null;
+  const claudeWeeklyResetsAt = claudeWin?.weeklyResetsAt ?? null;
+
+  // Maintain history: read, append (only when cw is a number), prune, write
+  let history = readHistory();
+  if (typeof claudeWeeklyPct === 'number') {
+    history.push({ t: nowMs, cw: claudeWeeklyPct });
+  }
+  // Prune to within TREND_LOOKBACK_MIN (re-use the constant's value directly)
+  const lookbackFloor = nowMs - 180 * 60 * 1000;
+  history = history.filter(p => p != null && typeof p.t === 'number' && p.t >= lookbackFloor);
+  if (history.length > HISTORY_MAX) history = history.slice(history.length - HISTORY_MAX);
+  writeHistory(history);
+
+  // Compute trend and embed in claude state
+  const weeklyTrend = projectWeeklyTrend(history, claudeWeeklyPct ?? 0, claudeWeeklyResetsAt, nowMs);
+
   const state = {
     generatedAt: new Date(nowMs).toISOString(),
     claude: (!claudeWin && tlines.length === 0) ? null : {
       fiveHourPct: claudeWin?.fiveHourPct ?? null,
-      weeklyPct: claudeWin?.weeklyPct ?? null,
-      resetsAt: claudeWin?.resetsAt ?? null,
+      weeklyPct: claudeWeeklyPct,
+      fiveHourResetsAt: claudeWin?.fiveHourResetsAt ?? null,
+      weeklyResetsAt: claudeWeeklyResetsAt,
+      resetsAt: claudeWeeklyResetsAt,   // back-compat alias
+      weeklyTrend,
       spentToday: claudeSpend.todayUncached, spent7d: claudeSpend.sevenDayUncached,
     },
     codex: codexRL ? { ...codexRL, spentToday: null, spent7d: null } : null,
