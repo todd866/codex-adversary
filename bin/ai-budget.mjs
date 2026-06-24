@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseCodexRateLimits, sumClaudeTranscriptTokens, parseClaudeUsageWindows,
-         formatSnapshot, formatIfBelow, projectWeeklyTrend } from './ai-budget-lib.mjs';
+         formatSnapshot, formatIfBelow, projectWeeklyTrend, pickClaudeWindows } from './ai-budget-lib.mjs';
 
 const HOME = homedir();
 const STATE = join(HOME, '.claude', '.cache', 'ai-budget.json');
@@ -80,15 +80,17 @@ async function refresh() {
   const codexRL = parseCodexRateLimits(newestCodexSessionLines(), nowEpoch);
   const tlines = allTranscriptLines();
   const claudeSpend = sumClaudeTranscriptTokens(tlines, nowMs);
-  const claudeWin = await claudeWindows(nowEpoch);
+  const freshWin = await claudeWindows(nowEpoch);
+  const claudeWin = pickClaudeWindows(freshWin, readState(), nowMs);
 
   const claudeWeeklyPct = claudeWin?.weeklyPct ?? null;
   const claudeWeeklyResetsAt = claudeWin?.weeklyResetsAt ?? null;
 
-  // Maintain history: read, append (only when cw is a number), prune, write
+  // Maintain history: append only on a FRESH fetch (never on a carried value,
+  // which would pollute the trend slope with repeated stale points).
   let history = readHistory();
-  if (typeof claudeWeeklyPct === 'number') {
-    history.push({ t: nowMs, cw: claudeWeeklyPct });
+  if (typeof freshWin?.weeklyPct === 'number') {
+    history.push({ t: nowMs, cw: freshWin.weeklyPct });
   }
   // Prune to within TREND_LOOKBACK_MIN (re-use the constant's value directly)
   const lookbackFloor = nowMs - 180 * 60 * 1000;

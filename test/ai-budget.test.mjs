@@ -524,3 +524,48 @@ test('formatSnapshot: 5h healthy, no trend → no extra notes', () => {
   const out = formatSnapshot(state, base);
   assert.doesNotMatch(out, /spend freely|trending/i, 'no extra notes when healthy');
 });
+
+// ── pickClaudeWindows tests ───────────────────────────────────────────────────
+import { pickClaudeWindows } from '../bin/ai-budget-lib.mjs';
+
+test('pickClaudeWindows: freshWin present → returned unchanged', () => {
+  const nowMs = Date.parse('2026-06-24T12:00:00Z');
+  const freshWin = { weeklyPct: 63, fiveHourPct: 45, fiveHourResetsAt: 1, weeklyResetsAt: 2 };
+  assert.deepEqual(pickClaudeWindows(freshWin, null, nowMs), freshWin);
+});
+
+test('pickClaudeWindows: freshWin null + prevState valid <15min old → carries subset', () => {
+  const nowMs = Date.parse('2026-06-24T12:00:00Z');
+  const twoMinAgo = new Date(nowMs - 2 * 60 * 1000).toISOString();
+  const prevState = {
+    generatedAt: twoMinAgo,
+    claude: { weeklyPct: 69, fiveHourPct: 33, fiveHourResetsAt: 1, weeklyResetsAt: 2 },
+  };
+  const result = pickClaudeWindows(null, prevState, nowMs);
+  assert.equal(result.weeklyPct, 69);
+  assert.equal(result.fiveHourPct, 33);
+  assert.equal(result.fiveHourResetsAt, 1);
+  assert.equal(result.weeklyResetsAt, 2);
+});
+
+test('pickClaudeWindows: freshWin null + prevState 20min old → null (too stale)', () => {
+  const nowMs = Date.parse('2026-06-24T12:00:00Z');
+  const twentyMinAgo = new Date(nowMs - 20 * 60 * 1000).toISOString();
+  const prevState = {
+    generatedAt: twentyMinAgo,
+    claude: { weeklyPct: 69, fiveHourPct: 33, fiveHourResetsAt: 1, weeklyResetsAt: 2 },
+  };
+  assert.equal(pickClaudeWindows(null, prevState, nowMs), null);
+});
+
+test('pickClaudeWindows: freshWin null + prevState.claude null → null', () => {
+  const nowMs = Date.parse('2026-06-24T12:00:00Z');
+  const twoMinAgo = new Date(nowMs - 2 * 60 * 1000).toISOString();
+  const prevState = { generatedAt: twoMinAgo, claude: null };
+  assert.equal(pickClaudeWindows(null, prevState, nowMs), null);
+});
+
+test('pickClaudeWindows: freshWin null + prevState null → null', () => {
+  const nowMs = Date.parse('2026-06-24T12:00:00Z');
+  assert.equal(pickClaudeWindows(null, null, nowMs), null);
+});
