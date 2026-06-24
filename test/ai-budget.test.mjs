@@ -71,3 +71,34 @@ test('parseClaudeUsageWindows: percent utilization + epoch reset, missing window
   assert.equal(r.weeklyPct, null);
   assert.equal(r.resetsAt, null);
 });
+
+import { lowestPct, formatSnapshot, formatIfBelow } from '../bin/ai-budget-lib.mjs';
+
+const STATE = {
+  generatedAt: '2026-06-24T12:00:00Z',
+  claude: { fiveHourPct: 62, weeklyPct: 18, resetsAt: 1782358258, spentToday: 4100000, spent7d: 22000000 },
+  codex:  { fiveHourPct: 99, weeklyPct: 81, resetsAt: 1782358258, spentToday: 0, spent7d: 2900000 },
+};
+const now = Date.parse('2026-06-24T12:00:40Z'); // 40s later
+
+test('lowestPct picks the smallest window', () => {
+  assert.equal(lowestPct(STATE), 18);
+});
+
+test('formatSnapshot mentions both providers and the age', () => {
+  const s = formatSnapshot(STATE, now);
+  assert.match(s, /Claude/); assert.match(s, /Codex/);
+  assert.match(s, /18%/); assert.match(s, /as of/);
+});
+
+test('formatIfBelow: silent when all >= pct, speaks + hints when below', () => {
+  assert.equal(formatIfBelow(STATE, 10, now), '');           // 18 >= 10 → silent
+  const s = formatIfBelow(STATE, 30, now);                    // 18 < 30 → speak
+  assert.match(s, /Claude weekly low|18%/);
+  assert.match(s, /Codex/);                                   // imbalance hint
+});
+
+test('formatSnapshot flags stale state', () => {
+  const stale = Date.parse('2026-06-24T12:20:00Z');           // 20 min later
+  assert.match(formatSnapshot(STATE, stale), /stale/i);
+});

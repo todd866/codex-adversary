@@ -79,3 +79,53 @@ export function parseClaudeUsageWindows(usage, nowEpoch) {
     resetsAt: reset(wk),
   };
 }
+
+const fmtTok = (n) => n == null ? 'n/a'
+  : n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M'
+  : n >= 1e3 ? Math.round(n / 1e3) + 'K' : String(n);
+const pct = (p) => p == null ? 'n/a' : p + '%';
+
+function ageStr(generatedAt, nowMs) {
+  const t = Date.parse(generatedAt);
+  if (Number.isNaN(t)) return { mins: Infinity, label: 'unknown age' };
+  const mins = (nowMs - t) / 60000;
+  const label = mins < 1.5 ? `as of ${Math.round(mins * 60)}s ago` : `as of ${Math.round(mins)}m ago`;
+  return { mins, label };
+}
+
+const allPcts = (p) => p ? [p.fiveHourPct, p.weeklyPct].filter((x) => typeof x === 'number') : [];
+export function lowestPct(state) {
+  const xs = [...allPcts(state?.claude), ...allPcts(state?.codex)];
+  return xs.length ? Math.min(...xs) : null;
+}
+
+function providerLine(name, p) {
+  if (!p) return `${name.padEnd(6)} n/a`;
+  return `${name.padEnd(6)} 5h ${pct(p.fiveHourPct)} · week ${pct(p.weeklyPct)} · `
+       + `spent ${fmtTok(p.spentToday)} today / ${fmtTok(p.spent7d)} 7d`;
+}
+
+export function formatSnapshot(state, nowMs) {
+  const { mins, label } = ageStr(state?.generatedAt, nowMs);
+  const stale = mins > 15 ? ' ⚠ stale — service may be down' : '';
+  return [providerLine('Claude', state?.claude), providerLine('Codex', state?.codex), `(${label}${stale})`].join('\n');
+}
+
+export function formatIfBelow(state, threshold, nowMs) {
+  const low = lowestPct(state);
+  if (low == null || low >= threshold) return '';
+  const lines = [`⚠ token budget low (${low}% on the tightest window):`,
+    providerLine('Claude', state?.claude), providerLine('Codex', state?.codex)];
+  const c = state?.claude, x = state?.codex;
+  const claudeLow = c && Math.min(...allPcts(c).concat(101)) < threshold;
+  const codexHigh = x && Math.min(...allPcts(x).concat(101)) >= 50;
+  if (claudeLow && codexHigh) {
+    lines.push('→ Claude is the constraint; Codex has idle budget. Prefer routing heavy/parallel '
+      + 'work to Codex and stay lean. Be deliberate before any big token spend.');
+  } else {
+    lines.push('→ Be deliberate before any big token spend; consider lower effort / batching.');
+  }
+  const { label } = ageStr(state?.generatedAt, nowMs);
+  lines.push(`(${label})`);
+  return lines.join('\n');
+}
