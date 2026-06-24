@@ -95,7 +95,7 @@ test('formatIfBelow: silent when all >= pct, speaks + hints when below', () => {
   assert.equal(formatIfBelow(STATE, 10, now), '');           // 18 >= 10 → silent
   const s = formatIfBelow(STATE, 30, now);                    // 18 < 30 → speak
   assert.match(s, /Claude weekly low|18%/);
-  assert.match(s, /Codex/);                                   // imbalance hint
+  assert.match(s, /Claude is the constraint/);                // the imbalance hint branch actually fired
 });
 
 test('formatSnapshot flags stale state', () => {
