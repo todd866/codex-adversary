@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.1 — 2026-06-24
+
+Sharper review prompts so Codex pushes back on **logic/correctness**, not style. The
+framing now explicitly forbids style / formatting / naming / lint / "consider…" nits,
+orders findings by severity, prefers one deep bug over ten shallow ones, and answers
+"nothing substantive" in one line instead of padding. Addresses the common complaint that
+a second model returns superficial nitpicking rather than real pushback. The synthesis
+contract gains a "triage hard for substance" rule.
+
 ## v0.2.0 — 2026-06-24
 
 Adds the **advisor** role — a prospective second opinion, alongside the retrospective review.

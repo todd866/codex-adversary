@@ -70,6 +70,11 @@ findings are inputs you weigh — never capitulate to them, never rubber-stamp t
 - **Agreements (both models) → high-confidence.** Surface these first.
 - **Codex-only findings → adjudicate with your own assessment**: agree / disagree /
   uncertain, with a one-line reason. Never rubber-stamp Codex; never silently drop it.
+- **Triage hard for substance.** Codex (like most LLMs in review mode) tends to over-produce
+  minor, defensive nits to look thorough. The wrapper's framing suppresses style/lint/cosmetic
+  comments — drop any that still slip through, and weight one deep correctness/logic finding
+  over a long list of shallow ones. A wall of nitpicks with no real issue means "nothing
+  substantive found", not "lots of problems".
 - **Factual disagreement on a material point → run ONE rebuttal round (adjudication,
   not persuasion).** Give the other model the specific counter-evidence — paste the repo
   lines that back a claim it called "unverifiable", or your reasoning for dismissing a
