@@ -3,7 +3,8 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSy
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { parseCodexRateLimits, sumClaudeTranscriptTokens, parseClaudeUsageWindows } from './ai-budget-lib.mjs';
+import { parseCodexRateLimits, sumClaudeTranscriptTokens, parseClaudeUsageWindows,
+         formatSnapshot, formatIfBelow } from './ai-budget-lib.mjs';
 
 const HOME = homedir();
 const STATE = join(HOME, '.claude', '.cache', 'ai-budget.json');
@@ -79,5 +80,16 @@ async function refresh() {
   } catch (e) { /* swallow — never break a session */ }
 }
 
-const cmd = process.argv[2];
-if (cmd === 'refresh') { await refresh().catch(() => {}); }
+export function readState(path = STATE) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+}
+
+if (process.argv[1]?.endsWith('ai-budget.mjs')) {
+  const cmd = process.argv[2];
+  if (cmd === 'refresh') { await refresh().catch(() => {}); }
+  else if (cmd === 'read') { const s = readState(); if (s) process.stdout.write(formatSnapshot(s, Date.now()) + '\n'); }
+  else if (cmd === 'if-below') {
+    const s = readState(); const pct = Number(process.argv[3] ?? 30);
+    if (s) { const out = formatIfBelow(s, pct, Date.now()); if (out) process.stdout.write(out + '\n'); }
+  }
+}

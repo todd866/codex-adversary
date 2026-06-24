@@ -102,3 +102,17 @@ test('formatSnapshot flags stale state', () => {
   const stale = Date.parse('2026-06-24T12:20:00Z');           // 20 min later
   assert.match(formatSnapshot(STATE, stale), /stale/i);
 });
+
+import { writeFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readState } from '../bin/ai-budget.mjs';
+
+test('readState returns parsed JSON, or null when missing/garbage', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aib-'));
+  const good = join(dir, 'good.json'); writeFileSync(good, JSON.stringify({ generatedAt: 'x' }));
+  assert.equal(readState(good).generatedAt, 'x');
+  assert.equal(readState(join(dir, 'missing.json')), null);
+  const bad = join(dir, 'bad.json'); writeFileSync(bad, 'not json');
+  assert.equal(readState(bad), null);
+});
