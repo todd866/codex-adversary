@@ -72,7 +72,7 @@ function toEpoch(v) {
 
 export function parseClaudeUsageWindows(usage, nowEpoch) {
   const fh = usage?.five_hour, wk = usage?.seven_day;
-  const reset = (w) => { const e = toEpoch(w?.resets_at); return e && e > nowEpoch ? e : null; };
+  const reset = (w) => { const e = toEpoch(w?.resets_at); return e !== null && e > nowEpoch ? e : null; };
   return {
     fiveHourPct: pctRemaining(fh),
     weeklyPct: pctRemaining(wk),

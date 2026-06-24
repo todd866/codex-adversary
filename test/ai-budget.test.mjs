@@ -69,4 +69,5 @@ test('parseClaudeUsageWindows: percent utilization + epoch reset, missing window
   const r = parseClaudeUsageWindows({ five_hour: { utilization: 40, resets_at: 1782314385 } }, now);
   assert.equal(r.fiveHourPct, 60);
   assert.equal(r.weeklyPct, null);
+  assert.equal(r.resetsAt, null);
 });
