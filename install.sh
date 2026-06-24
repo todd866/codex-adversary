@@ -30,6 +30,20 @@ mkdir -p "$DEST/bin" "$DEST/skills" "$DEST/commands"
 cp "$SRC/bin/codex-adversary.sh" "$DEST/bin/"
 chmod +x "$DEST/bin/codex-adversary.sh"
 
+# --- ai-budget: reader/service ---
+cp "$SRC/bin/ai-budget.mjs" "$SRC/bin/ai-budget-lib.mjs" "$DEST/bin/"
+if [ "$(uname)" = "Darwin" ] && command -v node >/dev/null 2>&1; then
+  LA="$HOME/Library/LaunchAgents/com.codex-adversary.ai-budget.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  sed "s#__BIN__#$DEST/bin/ai-budget.mjs#g" "$SRC/bin/com.codex-adversary.ai-budget.plist.template" > "$LA"
+  launchctl bootout "gui/$(id -u)/com.codex-adversary.ai-budget" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$LA" 2>/dev/null \
+    && echo "ai-budget service installed (first refresh may prompt for Keychain access — click Always Allow)." \
+    || echo "ai-budget: launchctl bootstrap failed; run 'node $DEST/bin/ai-budget.mjs refresh' manually."
+else
+  echo "ai-budget: non-macOS or no node — service not installed; readers will show what they can."
+fi
+
 # --- skills: never silently clobber a foreign same-named skill -------------------
 for src_skill in "$SRC"/skills/*/; do
   name="$(basename "$src_skill")"
