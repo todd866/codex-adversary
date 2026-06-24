@@ -46,7 +46,8 @@ else
 fi
 
 # --- merge ai-budget hooks into settings.json (idempotent, JSON-aware) ---
-node - "$DEST" <<'NODE'
+if command -v node >/dev/null 2>&1; then
+  node - "$DEST" <<'NODE'
 const fs = require('fs'); const path = require('path');
 const dest = process.argv[2]; const f = path.join(dest, 'settings.json');
 const bin = path.join(dest, 'bin', 'ai-budget.mjs');
@@ -69,6 +70,9 @@ for (const [event, { match, command }] of Object.entries(want)) {
 fs.writeFileSync(f, JSON.stringify(s, null, 2) + '\n');
 console.log('ai-budget hooks merged into', f);
 NODE
+else
+  echo "ai-budget: node not found — skipping settings.json hook merge."
+fi
 
 # --- skills: never silently clobber a foreign same-named skill -------------------
 for src_skill in "$SRC"/skills/*/; do
