@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.0 — 2026-06-24
+
+Adds **budget awareness** — live rate-limit visibility for both Codex and Claude
+inside every Claude Code session.
+
+- **`bin/ai-budget-lib.mjs`** — pure parsing and formatting library:
+  `parseCodexRateLimits` (from Codex session `.jsonl`),
+  `parseClaudeUsageWindows` (from the `/api/oauth/usage` response),
+  `sumClaudeTranscriptTokens` (local transcript tally, today and 7 days),
+  `formatSnapshot`, `formatIfBelow`, `lowestPct`, `readState`.
+- **`bin/ai-budget.mjs`** — CLI with three sub-commands:
+  `refresh` (read all sources, atomic-write `~/.claude/.cache/ai-budget.json`),
+  `read` (print both providers + age), `if-below <pct>` (conditional warning
+  with routing hint). Silent on a missing state file; never throws into a session.
+- **launchd LaunchAgent** (`com.codex-adversary.ai-budget.plist.template`) —
+  refreshes the state file every 60 seconds so hooks always see current data.
+- **Three hooks** in `~/.claude/settings.json` — `SessionStart` (refresh),
+  `UserPromptSubmit` and `PreToolUse` (if-below 30%) — installed by `install.sh`.
+- **`skills/budget-aware-allocation/SKILL.md`** — the behavioural half: how
+  Claude routes work when the budget hooks fire (prefer Codex when Claude is
+  constrained, stay lean before a big spend, flag when both are low).
+- **Tests** — 11 unit checks covering every parser, formatter, and `readState`
+  (including missing-file and garbage-JSON paths).
+
 ## v0.3.1 — 2026-06-24
 
 - Add **AGENTS.md**: an orientation + maintenance brief written for the *agent* working on a

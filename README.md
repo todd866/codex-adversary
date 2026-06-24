@@ -105,6 +105,65 @@ To install into a non-default location: `CLAUDE_HOME=/path/to/.claude ./install.
       | ~/.claude/bin/codex-adversary.sh --mode advise --repo .
   ```
 
+## Budget awareness
+
+`ai-budget` tracks how much of each provider's rate-limit window you've consumed
+and surfaces that context inside Claude Code before you spend more tokens on a
+heavy task.
+
+### What it reads
+
+| Source | What it gives you |
+|--------|-------------------|
+| `~/.codex/sessions/*.jsonl` | Codex 5-hour and weekly usage percentages, from the `rate_limits` events the Codex CLI writes after each call. |
+| macOS Keychain `Claude Code-credentials` → `GET /api/anthropic.com/api/oauth/usage` | Claude 5-hour and weekly usage percentages (requires the one-time Always-Allow below). |
+| `~/.claude/projects/**/*.jsonl` (last 8 days) | Claude uncached-token spend today and over 7 days, tallied from your local transcript log. |
+
+All reads are local or go to Anthropic's own usage API under your own bearer
+token. Nothing is sent to a third party.
+
+### The published state file
+
+`node bin/ai-budget.mjs refresh` computes all three sources and writes a
+snapshot to `~/.claude/.cache/ai-budget.json` (atomic `tmp → rename`). A
+launchd LaunchAgent re-runs this every 60 seconds so the file stays current
+without blocking your session.
+
+### The three reader hooks
+
+Installed by `./install.sh` into `~/.claude/settings.json`:
+
+| Hook | When | What it does |
+|------|------|-------------|
+| `SessionStart` | Every new Claude Code session | Runs `ai-budget.mjs refresh` so the session starts with fresh data. |
+| `UserPromptSubmit` | Before each prompt, if-below 30% | Injects a one-line budget warning into the conversation context when either provider is under 30% on any window. |
+| `PreToolUse` | Before any tool call, if-below 30% | Same budget check at the tool level — catches heavy parallel tool calls before they start. |
+
+### Manual check
+
+```bash
+node bin/ai-budget.mjs read       # prints current state (both providers, age)
+node bin/ai-budget.mjs if-below 30  # prints a warning only if < 30% remaining
+```
+
+`read` is silent (no output, exit 0) if the state file is absent or
+unreadable — it never errors out mid-session.
+
+### One-time macOS Keychain prompt
+
+The first time `refresh` fetches Claude's usage from the API, macOS asks
+whether to allow access to `Claude Code-credentials` in your keychain.
+Click **Always Allow**. After that the service runs silently. If you decline,
+Claude's API-derived percentage is omitted and only the local transcript tally
+is used.
+
+### The behavioural half
+
+The `budget-aware-allocation` skill (installed to `~/.claude/skills/`) is what
+Claude reads when the hooks fire. It decides how to route work — preferring
+Codex for heavy or parallel tasks when Claude's window is tighter, staying lean
+before a big spend, and flagging when both providers are low.
+
 ## Safety
 
 The read-only sandbox stops Codex from *writing* your files. It does **not** make your
