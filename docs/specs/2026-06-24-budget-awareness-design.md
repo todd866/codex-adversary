@@ -65,13 +65,13 @@ below `<pct>` (+ the allocation hint), else nothing. Both stamp the snapshot's a
 **Published state** — `~/.claude/.cache/ai-budget.json`, the contract between
 service and readers:
 ```json
-{ "generatedAt": "<iso>",
-  "claude": { "fiveHourPct": 62, "weeklyPct": 18, "resetsAt": "<iso>",
-              "spentTodayTokens": 4100000, "spent7dTokens": 22000000 },
-  "codex":  { "fiveHourPct": 99, "weeklyPct": 81, "resetsAt": "<iso>",
-              "spentTodayTokens": 0, "spent7dTokens": 2900000 },
-  "errors": [] }
+{ "generatedAt": "2026-06-24T04:00:00.000Z",
+  "claude": { "fiveHourPct": 62, "weeklyPct": 18, "resetsAt": 1750820400,
+              "spentToday": 4100000, "spent7d": 22000000 },
+  "codex":  { "fiveHourPct": 99, "weeklyPct": 81, "resetsAt": 1750734000,
+              "spentToday": 0, "spent7d": 2900000 } }
 ```
+(`resetsAt` is a Unix epoch number; `spentToday`/`spent7d` are uncached token counts; no `errors` field.)
 `null` for any window the service couldn't read (→ readers show `n/a`).
 
 **Snapshot format** (compact, one line per provider; goes into Claude's context):

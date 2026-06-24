@@ -30,6 +30,54 @@ mkdir -p "$DEST/bin" "$DEST/skills" "$DEST/commands"
 cp "$SRC/bin/codex-adversary.sh" "$DEST/bin/"
 chmod +x "$DEST/bin/codex-adversary.sh"
 
+# --- ai-budget: reader/service ---
+cp "$SRC/bin/ai-budget.mjs" "$SRC/bin/ai-budget-lib.mjs" "$DEST/bin/"
+if [ "$(uname)" = "Darwin" ] && command -v node >/dev/null 2>&1; then
+  NODE_BIN="$(command -v node)"
+  LA="$HOME/Library/LaunchAgents/com.codex-adversary.ai-budget.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  sed -e "s#__NODE__#$NODE_BIN#g" -e "s#__BIN__#$DEST/bin/ai-budget.mjs#g" "$SRC/bin/com.codex-adversary.ai-budget.plist.template" > "$LA"
+  launchctl bootout "gui/$(id -u)/com.codex-adversary.ai-budget" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$LA" 2>/dev/null \
+    && echo "ai-budget service installed (first refresh may prompt for Keychain access — click Always Allow)." \
+    || echo "ai-budget: launchctl bootstrap failed; run 'node $DEST/bin/ai-budget.mjs refresh' manually."
+else
+  echo "ai-budget: non-macOS or no node — service not installed; readers will show what they can."
+fi
+
+# --- merge ai-budget hooks into settings.json (idempotent, JSON-aware) ---
+if command -v node >/dev/null 2>&1; then
+  node - "$DEST" <<'NODE'
+const fs = require('fs'); const path = require('path');
+const dest = process.argv[2]; const f = path.join(dest, 'settings.json');
+const bin = path.join(dest, 'bin', 'ai-budget.mjs');
+let s = {};
+if (fs.existsSync(f)) {
+  try { s = JSON.parse(fs.readFileSync(f, 'utf8')); }
+  catch (e) { console.log('ai-budget: settings.json could not be parsed (JSONC or corrupt) — skipping hook merge to avoid data loss.'); process.exit(0); }
+}
+s.hooks ||= {};
+const cmd = (args) => `node "${bin}" ${args}`;
+const want = {
+  SessionStart:     { match: null,                  command: cmd('read') },
+  UserPromptSubmit: { match: null,                  command: cmd('if-below 30') },
+  PreToolUse:       { match: 'Workflow|Agent|Task',  command: cmd('if-below 30') },
+};
+for (const [event, { match, command }] of Object.entries(want)) {
+  s.hooks[event] ||= [];
+  const has = JSON.stringify(s.hooks[event]).includes('ai-budget.mjs');
+  if (has) continue;
+  const entry = { hooks: [{ type: 'command', command }] };
+  if (match) entry.matcher = match;
+  s.hooks[event].push(entry);
+}
+fs.writeFileSync(f, JSON.stringify(s, null, 2) + '\n');
+console.log('ai-budget hooks merged into', f);
+NODE
+else
+  echo "ai-budget: node not found — skipping settings.json hook merge."
+fi
+
 # --- skills: never silently clobber a foreign same-named skill -------------------
 for src_skill in "$SRC"/skills/*/; do
   name="$(basename "$src_skill")"
