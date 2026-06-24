@@ -36,24 +36,43 @@ ourselves. No dependency on the app.
 
 **Open feasibility item (resolve in the plan, not now):** whether the Keychain
 credential *embeds* the usage windows or whether the OAuth token must be used to
-*call* Anthropic's usage endpoint. Port Glancebar's exact approach. Either way the
-~3-minute cache (below) bounds the cost to a couple of reads per session.
+*call* Anthropic's usage endpoint. Port Glancebar's exact approach. Either way this
+work is owned by the out-of-band **service** (below), so any cost or network call
+is off the agent's critical path — agents only ever poll the published JSON.
 
 ## Components
 
-### 1. `bin/ai-budget.sh` — the single reader
-One script, the source of truth. Pure file/Keychain reads; no network unless the
-Keychain path demands it.
+### 1. The budget service (daemon) + thin readers
+Split into a **refresher** (the service) and **readers** (what hooks call), so an
+agent never blocks on a live read or a Keychain prompt mid-turn. Agents *poll the
+published state*; they never compute it.
 
-- **`ai-budget`** → prints a compact snapshot (see format below).
-- **`ai-budget --if-below <pct>`** → prints **only** when some window is below
-  `<pct>` remaining; otherwise prints nothing and exits 0 (silent when healthy).
-  When it does print, it appends the allocation hint (below).
-- **Caching:** writes `~/.claude/.cache/ai-budget.json` with a timestamp; reuses
-  it for ~180s so per-prompt hook calls are cheap. `--no-cache` forces a refresh.
-- **Degrade, never block:** any source that errors (Keychain prompt/deny on
-  macOS, missing codex sessions, non-macOS) renders that signal as `n/a` and the
-  script still exits 0 with whatever it has.
+**`ai-budget refresh` — the service.** Runs out-of-band on a schedule (a launchd
+LaunchAgent on macOS — installed below). Reads all sources and **publishes** the
+current state to `~/.claude/.cache/ai-budget.json` via an atomic write. Because
+it's a single stable binary path, the macOS Keychain read is authorised **once**
+("Always Allow") and never prompts again — the per-turn prompt problem disappears.
+Cadence: cheap file sources (codex sessions, my transcripts) ~every 60s; the
+Claude Keychain/OAuth window ~every 5 min (or the endpoint's sane floor). The
+service is the *only* thing that touches the live sources.
+
+**`ai-budget read` / `ai-budget if-below <pct>` — the readers (what hooks run).**
+Read ONLY the published JSON. Instant, never compute, never block, never prompt.
+`read` prints the compact snapshot; `if-below <pct>` prints only when a window is
+below `<pct>` (+ the allocation hint), else nothing. Both stamp the snapshot's age
+("as of 40s ago") and flag staleness if the service has fallen behind.
+
+**Published state** — `~/.claude/.cache/ai-budget.json`, the contract between
+service and readers:
+```json
+{ "generatedAt": "<iso>",
+  "claude": { "fiveHourPct": 62, "weeklyPct": 18, "resetsAt": "<iso>",
+              "spentTodayTokens": 4100000, "spent7dTokens": 22000000 },
+  "codex":  { "fiveHourPct": 99, "weeklyPct": 81, "resetsAt": "<iso>",
+              "spentTodayTokens": 0, "spent7dTokens": 2900000 },
+  "errors": [] }
+```
+`null` for any window the service couldn't read (→ readers show `n/a`).
 
 **Snapshot format** (compact, one line per provider; goes into Claude's context):
 ```
@@ -72,12 +91,13 @@ Budget is spent in every project, so the hooks are user-level, not per-project.
 
 | Event | Command | Effect |
 |-------|---------|--------|
-| `SessionStart` | `ai-budget` | Full snapshot — where I stand when a session opens. |
-| `UserPromptSubmit` | `ai-budget --if-below 30` | Re-checks (cached) each turn; injects **only** when a window < 30%. Catches the offhand-comment-near-limit case without noise when healthy. |
-| `PreToolUse` matcher `Workflow\|Agent\|Task` | `ai-budget --if-below 30` | A sharp "near the limit — consider Codex" right before a big fan-out. **Non-blocking** (soft policy). |
+| `SessionStart` | `ai-budget read` | Full snapshot (from the published state) — where I stand when a session opens. |
+| `UserPromptSubmit` | `ai-budget if-below 30` | Polls the published state each turn; injects **only** when a window < 30%. Catches the offhand-comment-near-limit case, silent when healthy. |
+| `PreToolUse` matcher `Workflow\|Agent\|Task` | `ai-budget if-below 30` | A sharp "near the limit — consider Codex" right before a big fan-out. **Non-blocking** (soft policy). |
 
-These merge alongside the existing `SessionEnd` config-backup hook; nothing is
-overwritten.
+Every hook command is a pure **reader** of the published JSON — instant, no
+compute, no Keychain, no network. They merge alongside the existing `SessionEnd`
+config-backup hook; nothing is overwritten.
 
 ### 3. Guardrail policy skill — `skills/budget-aware-allocation/`
 Feature 1's behavioural half (a `SKILL.md`, same layout as the existing
@@ -88,27 +108,43 @@ note that Codex has idle budget for heavy lifting. (The *mechanism* to actually
 delegate execution to a Codex worker is Feature 2; Feature 1 makes Claude stop and
 notice, and it can already route *review/advice* to Codex via the existing skills.)
 
-### 4. `install.sh` enhancement — wire the hooks idempotently
+### 4. `install.sh` enhancement — service + hooks, idempotent
 Today `install.sh` copies `bin/`, `skills/`, `commands/` into `$DEST`
-(`CLAUDE_HOME`, default `~/.claude`). Add: copy `bin/ai-budget.sh`, and **merge**
-the three hooks into `$DEST/settings.json` (create it if absent; preserve any
-existing hooks; skip if already present — idempotent). Use a JSON-aware merge
-(node/jq), never a blind overwrite.
+(`CLAUDE_HOME`, default `~/.claude`). Add:
+- Copy `bin/ai-budget.sh` into `$DEST/bin/`.
+- **Install the service:** a launchd LaunchAgent
+  (`~/Library/LaunchAgents/com.codex-adversary.ai-budget.plist`) that runs
+  `ai-budget refresh` on the cadence above + at login, `launchctl bootstrap`-ed
+  (idempotent: reload if present). macOS-only; on other OSes skip the LaunchAgent
+  and the readers fall back to an inline refresh on a longer cache (degraded but
+  functional).
+- **Merge the three hooks** into `$DEST/settings.json` (create if absent; preserve
+  existing hooks incl. the SessionEnd backup; skip if already present). JSON-aware
+  merge (node/jq), never a blind overwrite.
+- First-run note: the user clicks "Always Allow" once on the Keychain prompt the
+  service triggers; thereafter it is silent.
 
 ## Data flow
 ```
-hook fires → ai-budget.sh (cached ≤180s)
-           → reads codex sessions + Claude Keychain + my transcripts
-           → snapshot string (+ hint, if --if-below tripped)
-           → injected into Claude's context (SessionStart / per-prompt / pre-fan-out)
+launchd timer → ai-budget refresh    (out-of-band; ~60s files / ~5min Keychain)
+              → reads codex sessions + Claude Keychain + my transcripts
+              → atomically publishes ~/.claude/.cache/ai-budget.json
+
+hook fires    → ai-budget read | if-below 30    (just reads the JSON; instant)
+              → snapshot string (+ hint / staleness)
+              → injected into Claude's context (SessionStart / per-prompt / pre-fan-out)
 ```
 
 ## Error handling
-- Keychain read prompts/denies or non-macOS → Claude `%` = `n/a`; fall back to the
-  spend trend. Never block.
-- No codex sessions yet / unparseable → Codex `n/a`.
-- Cache read/write failure → compute fresh; if compute fails entirely, print
-  nothing and exit 0. A budget reader must never break a session.
+- **Service down / state stale:** readers read whatever JSON exists; if
+  `generatedAt` is older than a threshold (~15 min) they append "⚠ budget data
+  stale — service may be down" so a number is never silently trusted as live. File
+  missing entirely → reader prints nothing, exits 0.
+- **Per-window failure:** Keychain prompts/denies or non-macOS → service writes
+  Claude windows as `null` (readers show `n/a`, fall back to spend trend). No codex
+  sessions / unparseable → Codex `null`. One dead source never blanks the others.
+- A **reader** (the hook path) must NEVER block, prompt, or break a session — it
+  only reads a local JSON file. All the fragile work lives in the service.
 
 ## Testing
 Unit-test the three pure parsers against fixture files (the parse logic split out
@@ -119,8 +155,10 @@ from the I/O so it's testable headless):
    cached-inclusive vs uncached.
 3. Claude usage-window parse — tolerant of fraction-or-percent utilization and
    ISO-or-epoch `resets_at`.
-Plus a smoke test: `ai-budget` exits 0 and prints *something* (or nothing for
-`--if-below` when healthy) on a machine with no codex/keychain data.
+Plus a **reader** test — given a fixture `ai-budget.json`, `read` / `if-below`
+produce the right snapshot, threshold gating, and staleness flag — and a smoke
+test that readers exit 0 and never prompt/block even when the published file is
+missing or stale.
 
 ## Out of scope (→ Feature 2)
 - The Codex **worker/executor** mechanism (today `codex-adversary.sh` is read-only
