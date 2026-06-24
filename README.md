@@ -116,7 +116,7 @@ heavy task.
 | Source | What it gives you |
 |--------|-------------------|
 | `~/.codex/sessions/*.jsonl` | Codex 5-hour and weekly usage percentages, from the `rate_limits` events the Codex CLI writes after each call. |
-| macOS Keychain `Claude Code-credentials` → `GET /api/anthropic.com/api/oauth/usage` | Claude 5-hour and weekly usage percentages (requires the one-time Always-Allow below). |
+| macOS Keychain `Claude Code-credentials` → `GET https://api.anthropic.com/api/oauth/usage` | Claude 5-hour and weekly usage percentages (requires the one-time Always-Allow below). |
 | `~/.claude/projects/**/*.jsonl` (last 8 days) | Claude uncached-token spend today and over 7 days, tallied from your local transcript log. |
 
 All reads are local or go to Anthropic's own usage API under your own bearer
@@ -135,7 +135,7 @@ Installed by `./install.sh` into `~/.claude/settings.json`:
 
 | Hook | When | What it does |
 |------|------|-------------|
-| `SessionStart` | Every new Claude Code session | Runs `ai-budget.mjs refresh` so the session starts with fresh data. |
+| `SessionStart` | Every new Claude Code session | Runs `ai-budget.mjs read` to print the current snapshot at session open (the launchd service handles `refresh` on its own schedule). |
 | `UserPromptSubmit` | Before each prompt, if-below 30% | Injects a one-line budget warning into the conversation context when either provider is under 30% on any window. |
 | `PreToolUse` | Before any tool call, if-below 30% | Same budget check at the tool level — catches heavy parallel tool calls before they start. |
 

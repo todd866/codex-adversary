@@ -50,6 +50,7 @@ async function claudeWindows(nowEpoch) {
   try {
     const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) return null;
     return parseClaudeUsageWindows(await res.json(), nowEpoch);

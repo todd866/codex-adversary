@@ -51,7 +51,11 @@ if command -v node >/dev/null 2>&1; then
 const fs = require('fs'); const path = require('path');
 const dest = process.argv[2]; const f = path.join(dest, 'settings.json');
 const bin = path.join(dest, 'bin', 'ai-budget.mjs');
-const s = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {};
+let s = {};
+if (fs.existsSync(f)) {
+  try { s = JSON.parse(fs.readFileSync(f, 'utf8')); }
+  catch (e) { console.log('ai-budget: settings.json could not be parsed (JSONC or corrupt) — skipping hook merge to avoid data loss.'); process.exit(0); }
+}
 s.hooks ||= {};
 const cmd = (args) => `node "${bin}" ${args}`;
 const want = {
