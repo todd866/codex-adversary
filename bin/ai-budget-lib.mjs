@@ -54,3 +54,28 @@ export function sumClaudeTranscriptTokens(lines, nowMs) {
   }
   return { todayUncached, today, sevenDayUncached, sevenDay };
 }
+
+function pctRemaining(win) {
+  if (!win || win.utilization == null) return null;
+  const u = Number(win.utilization);
+  if (Number.isNaN(u)) return null;
+  const usedPct = u <= 1 ? u * 100 : u;           // fraction-or-percent tolerant
+  return Math.round(100 - usedPct);
+}
+
+function toEpoch(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? null : Math.floor(t / 1000);
+}
+
+export function parseClaudeUsageWindows(usage, nowEpoch) {
+  const fh = usage?.five_hour, wk = usage?.seven_day;
+  const reset = (w) => { const e = toEpoch(w?.resets_at); return e && e > nowEpoch ? e : null; };
+  return {
+    fiveHourPct: pctRemaining(fh),
+    weeklyPct: pctRemaining(wk),
+    resetsAt: reset(wk),
+  };
+}

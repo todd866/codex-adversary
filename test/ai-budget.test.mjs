@@ -49,3 +49,24 @@ test('sumClaudeTranscriptTokens: today vs 7d, uncached vs cached-inclusive', () 
   assert.equal(r.sevenDayUncached, 160 + 280); // +(200+0+80)
   assert.equal(r.sevenDay, 1160 + 780);        // +(280+500)
 });
+
+import { parseClaudeUsageWindows } from '../bin/ai-budget-lib.mjs';
+
+test('parseClaudeUsageWindows: fraction utilization + ISO reset', () => {
+  const now = Math.floor(Date.parse('2026-06-24T12:00:00Z') / 1000);
+  const usage = {
+    five_hour: { utilization: 0.38, resets_at: '2026-06-24T13:30:00Z' },
+    seven_day: { utilization: 0.82, resets_at: '2026-06-25T13:30:00Z' },
+  };
+  const r = parseClaudeUsageWindows(usage, now);
+  assert.equal(r.fiveHourPct, 62);
+  assert.equal(r.weeklyPct, 18);
+  assert.equal(r.resetsAt, Math.floor(Date.parse('2026-06-25T13:30:00Z') / 1000));
+});
+
+test('parseClaudeUsageWindows: percent utilization + epoch reset, missing windows → null', () => {
+  const now = 1782300000;
+  const r = parseClaudeUsageWindows({ five_hour: { utilization: 40, resets_at: 1782314385 } }, now);
+  assert.equal(r.fiveHourPct, 60);
+  assert.equal(r.weeklyPct, null);
+});
