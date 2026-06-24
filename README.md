@@ -158,6 +158,11 @@ Exit codes: `0` ran · `2` usage · `3` not installed · `4` failed/empty · `5`
 Removes the installed files (only those carrying this project's stamp) and strips the
 directive block from `~/.claude/CLAUDE.md`.
 
+## Forking
+
+Forks are encouraged — each one carries its own maintainer. If you're an agent working on a
+clone (or pointing one at this), start with [AGENTS.md](AGENTS.md).
+
 ## License
 
 MIT © Ian Todd. Built with Claude Code.

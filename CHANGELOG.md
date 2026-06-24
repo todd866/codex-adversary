@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.1 — 2026-06-24
+
+- Add **AGENTS.md**: an orientation + maintenance brief written for the *agent* working on a
+  fork — how to check compatibility, tune the framing/synthesis, dogfood changes with the tool
+  itself, and keep tests honest — plus the project's agent-first, self-maintaining-forks
+  philosophy.
+
 ## v0.3.0 — 2026-06-24
 
 Resilience to Codex CLI version drift, instead of silently breaking when a flag changes.
