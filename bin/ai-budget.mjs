@@ -63,19 +63,21 @@ async function refresh() {
   const claudeWin = await claudeWindows(nowEpoch);
   const state = {
     generatedAt: new Date(nowMs).toISOString(),
-    claude: claudeWin || claudeSpend ? {
+    claude: (!claudeWin && tlines.length === 0) ? null : {
       fiveHourPct: claudeWin?.fiveHourPct ?? null,
       weeklyPct: claudeWin?.weeklyPct ?? null,
       resetsAt: claudeWin?.resetsAt ?? null,
-      spentToday: claudeSpend.today, spent7d: claudeSpend.sevenDay,
-    } : null,
+      spentToday: claudeSpend.todayUncached, spent7d: claudeSpend.sevenDayUncached,
+    },
     codex: codexRL ? { ...codexRL, spentToday: null, spent7d: null } : null,
   };
-  mkdirSync(join(HOME, '.claude', '.cache'), { recursive: true });
-  const tmp = STATE + '.tmp';
-  writeFileSync(tmp, JSON.stringify(state, null, 2));
-  renameSync(tmp, STATE);
+  try {
+    mkdirSync(join(HOME, '.claude', '.cache'), { recursive: true });
+    const tmp = STATE + '.tmp';
+    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    renameSync(tmp, STATE);
+  } catch (e) { /* swallow — never break a session */ }
 }
 
 const cmd = process.argv[2];
-if (cmd === 'refresh') { await refresh(); }
+if (cmd === 'refresh') { await refresh().catch(() => {}); }
