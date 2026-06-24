@@ -33,3 +33,24 @@ export function parseCodexRateLimits(lines, nowEpoch) {
     resetsAt: weeklyReset,
   };
 }
+
+export function sumClaudeTranscriptTokens(lines, nowMs) {
+  const dayMs = 86400000;
+  const todayUTC = new Date(nowMs).toISOString().slice(0, 10);
+  const sevenDayFloor = nowMs - 7 * dayMs;
+  let todayUncached = 0, today = 0, sevenDayUncached = 0, sevenDay = 0;
+  for (const line of lines) {
+    if (!line.includes('"usage"')) continue;           // cheap pre-filter
+    let obj; try { obj = JSON.parse(line); } catch { continue; }
+    const u = obj?.message?.usage ?? obj?.usage;
+    const ts = obj?.timestamp;
+    if (!u || !ts) continue;
+    const t = Date.parse(ts);
+    if (Number.isNaN(t)) continue;
+    const uncached = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
+    const full = uncached + (u.cache_read_input_tokens || 0);
+    if (t >= sevenDayFloor) { sevenDayUncached += uncached; sevenDay += full; }
+    if (ts.slice(0, 10) === todayUTC) { todayUncached += uncached; today += full; }
+  }
+  return { todayUncached, today, sevenDayUncached, sevenDay };
+}

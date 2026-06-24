@@ -29,3 +29,23 @@ test('parseCodexRateLimits: drops an already-reset window, returns null when non
 test('parseCodexRateLimits: no rate_limits anywhere → null', () => {
   assert.equal(parseCodexRateLimits(['{"type":"message"}', 'not json'], 1782300000), null);
 });
+
+import { sumClaudeTranscriptTokens } from '../bin/ai-budget-lib.mjs';
+
+test('sumClaudeTranscriptTokens: today vs 7d, uncached vs cached-inclusive', () => {
+  const now = Date.parse('2026-06-24T12:00:00Z');
+  const mk = (ts, i, o, cc, cr) => JSON.stringify({
+    timestamp: ts, message: { usage: {
+      input_tokens: i, output_tokens: o, cache_creation_input_tokens: cc, cache_read_input_tokens: cr } } });
+  const lines = [
+    mk('2026-06-24T09:00:00Z', 100, 50, 10, 1000), // today
+    mk('2026-06-20T09:00:00Z', 200, 80, 0, 500),   // within 7d, not today
+    mk('2026-06-10T09:00:00Z', 999, 999, 0, 0),    // older than 7d
+    '{"type":"user"}',                              // no usage → ignored
+  ];
+  const r = sumClaudeTranscriptTokens(lines, now);
+  assert.equal(r.todayUncached, 160);          // 100+10+50
+  assert.equal(r.today, 1160);                 // +1000 cache_read
+  assert.equal(r.sevenDayUncached, 160 + 280); // +(200+0+80)
+  assert.equal(r.sevenDay, 1160 + 780);        // +(280+500)
+});
