@@ -525,6 +525,112 @@ test('formatSnapshot: 5h healthy, no trend → no extra notes', () => {
   assert.doesNotMatch(out, /spend freely|trending/i, 'no extra notes when healthy');
 });
 
+// ── Disambiguation: "% left" labelling + "used" tokens + inline ⚠ marker ─────
+// Regression for 2026-06-27: the glance rendered "week 9% · spent 120M" with the
+// percentage UNLABELLED and sitting next to "spent", so a reader (human or model)
+// read 9% as SPENT rather than REMAINING. The numbers are remaining; say so.
+import { routingAdvice, weeklyIsConstraining } from '../bin/ai-budget-lib.mjs';
+
+// The exact real state that triggered the misread: Claude weekly 9% (critical,
+// trending dry), Codex weekly 91% (idle headroom). reset days away.
+const CRIT_STATE = () => {
+  const base = Date.parse('2026-06-27T23:43:00Z');
+  const weeklyResetsAt = Math.floor(base / 1000) + 5 * 24 * 3600;
+  return {
+    state: {
+      generatedAt: '2026-06-27T23:43:00Z',
+      claude: {
+        fiveHourPct: 95, weeklyPct: 9,
+        fiveHourResetsAt: Math.floor(base / 1000) + 3 * 3600,
+        weeklyResetsAt, resetsAt: weeklyResetsAt,
+        weeklyTrend: { slope: -2.6e-7, projectedEmptyAt: base + 5 * 3600000, willRunDryBeforeReset: true },
+        spentToday: 121247523, spent7d: 715813109,
+      },
+      codex: {
+        fiveHourPct: null, weeklyPct: 91,
+        fiveHourResetsAt: null, weeklyResetsAt, resetsAt: weeklyResetsAt,
+        spentToday: null, spent7d: null,
+      },
+    },
+    now: base + 40000,
+  };
+};
+
+test('formatSnapshot: percentages are labelled "left" (not bare %) so remaining≠spent', () => {
+  const { state, now } = CRIT_STATE();
+  const out = formatSnapshot(state, now);
+  assert.match(out, /week 9% left/, 'weekly must read as remaining ("9% left")');
+  assert.match(out, /5h 95% left/, '5h must read as remaining ("95% left")');
+  assert.match(out, /week 91% left/, 'Codex weekly must read as remaining');
+  // The consumed-tokens column must NOT be a bare "%" that can be confused for it
+  assert.match(out, /used /, 'consumed tokens labelled "used", contrasting with "left"');
+});
+
+test('formatSnapshot: critical weekly window gets an inline ⚠ marker', () => {
+  const { state, now } = CRIT_STATE();
+  const out = formatSnapshot(state, now);
+  // The ⚠ sits on the Claude weekly window (the one that is critical)…
+  assert.match(out, /week 9% left ⚠/, 'critical Claude weekly carries inline ⚠');
+  // …and NOT on the healthy Codex weekly window.
+  assert.doesNotMatch(out, /week 91% left ⚠/, 'healthy Codex weekly has no ⚠');
+});
+
+test('formatSnapshot: surfaces the actionable verdict — constraint + offload target', () => {
+  const { state, now } = CRIT_STATE();
+  const out = formatSnapshot(state, now);
+  assert.match(out, /Claude is the constraint/i, 'names which provider is the bottleneck');
+  assert.match(out, /9%/, 'states the constraining number');
+  assert.match(out, /run dry/i, 'carries the trend when trending dry');
+  assert.match(out, /Codex has 91% left/i, 'names the offload target AND its headroom');
+  assert.match(out, /route .*there|route heavy/i, 'tells you to route heavy work to Codex');
+});
+
+test('formatSnapshot: healthy weekly → no verdict, no ⚠ marker', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const weeklyResetsAt = Math.floor(base / 1000) + 5 * 24 * 3600;
+  const state = {
+    generatedAt: '2026-06-24T12:00:00Z',
+    claude: { fiveHourPct: 80, weeklyPct: 65, fiveHourResetsAt: Math.floor(base/1000)+3*3600,
+              weeklyResetsAt, resetsAt: weeklyResetsAt,
+              weeklyTrend: { slope: null, projectedEmptyAt: null, willRunDryBeforeReset: false },
+              spentToday: 1000, spent7d: 5000 },
+    codex: { fiveHourPct: 90, weeklyPct: 88, weeklyResetsAt, resetsAt: weeklyResetsAt, spentToday: null, spent7d: null },
+  };
+  const out = formatSnapshot(state, base);
+  assert.doesNotMatch(out, /⚠/, 'no inline marker when healthy');
+  assert.doesNotMatch(out, /is the constraint/i, 'no verdict when healthy');
+  assert.match(out, /week 65% left/, 'still labelled "left"');
+});
+
+test('routingAdvice: codex healthy → names its headroom + says route there', () => {
+  assert.match(routingAdvice(91), /Codex has 91% left/i);
+  assert.match(routingAdvice(91), /route/i);
+});
+
+test('routingAdvice: codex unhealthy/unknown → frugal advice, no false offload', () => {
+  assert.doesNotMatch(routingAdvice(20), /route/i);
+  assert.match(routingAdvice(20), /deliberate|batch|lower effort/i);
+  assert.doesNotMatch(routingAdvice(null), /route/i);
+});
+
+test('weeklyIsConstraining: floor, trend, reset-soon, healthy', () => {
+  const base = Date.parse('2026-06-24T12:00:00Z');
+  const farReset = Math.floor(base / 1000) + 5 * 24 * 3600;
+  const soonReset = Math.floor(base / 1000) + 20 * 60;
+  // below floor (12) far from reset → constraining
+  assert.equal(weeklyIsConstraining({ weeklyPct: 9, weeklyResetsAt: farReset }, base), true);
+  // below watch (30) + trending dry → constraining
+  assert.equal(weeklyIsConstraining({ weeklyPct: 25, weeklyResetsAt: farReset,
+    weeklyTrend: { willRunDryBeforeReset: true } }, base), true);
+  // below floor BUT resetting soon → NOT constraining (use-it-or-lose-it)
+  assert.equal(weeklyIsConstraining({ weeklyPct: 9, weeklyResetsAt: soonReset }, base), false);
+  // healthy → not constraining
+  assert.equal(weeklyIsConstraining({ weeklyPct: 65, weeklyResetsAt: farReset }, base), false);
+  // null pct / null provider → not constraining, no throw
+  assert.equal(weeklyIsConstraining({ weeklyPct: null }, base), false);
+  assert.equal(weeklyIsConstraining(null, base), false);
+});
+
 // ── pickClaudeWindows tests ───────────────────────────────────────────────────
 import { pickClaudeWindows } from '../bin/ai-budget-lib.mjs';
 

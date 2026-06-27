@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.5.1 — 2026-06-28
+
+Budget-snapshot **disambiguation + actionable verdict** — after a reader (a model)
+misread `week 9%` as 9%-*spent* when it meant 9%-*remaining*, because the bare
+percentage sat next to the `spent …` token column.
+
+- **Percentages now render as `N% left`** (both `5h` and `week`), and the consumed
+  column is labelled `used …` — so remaining can't be confused with spent.
+- **Inline `⚠`** on the *constraining* weekly window (`week 9% left ⚠`); the healthy
+  provider gets none. 5h-low never gets it (use-it-or-lose-it, not a problem).
+- **`formatSnapshot` (the once-per-session glance) now carries the verdict** that
+  was previously only in the pre-big-op gate: *which* provider is the bottleneck,
+  its remaining headroom, the trend, and *where to offload* — e.g. "Claude is the
+  constraint — 9% week left, on track to run dry before reset. Codex has 91% left
+  — route heavy/parallel work there." Don't make the reader infer the conclusion.
+- **Refactor:** new shared `weeklyIsConstraining()` predicate + `routingAdvice()`
+  sentence, used by *both* the glance and the gate so they never disagree.
+- **Tests:** +7 (label/marker/verdict regression on the exact 9%/91% state,
+  `routingAdvice`, `weeklyIsConstraining`). 47/47 green.
+
 ## v0.5.0 — 2026-06-27
 
 - **`--mode scout`** on the wrapper: read-only reconnaissance that returns a *compressed target

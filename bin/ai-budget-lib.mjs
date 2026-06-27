@@ -92,6 +92,9 @@ const fmtTok = (n) => n == null ? 'n/a'
   : n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M'
   : n >= 1e3 ? Math.round(n / 1e3) + 'K' : String(n);
 const pct = (p) => p == null ? 'n/a' : p + '%';
+// A window percentage is REMAINING, never spent — always render it as "N% left"
+// so it can't be confused with the "used X tokens" column beside it.
+const pctLeft = (p) => p == null ? 'n/a' : `${p}% left`;
 
 function ageStr(generatedAt, nowMs) {
   const t = Date.parse(generatedAt);
@@ -107,32 +110,47 @@ export function lowestPct(state) {
   return xs.length ? Math.min(...xs) : null;
 }
 
-function providerLine(name, p) {
+function providerLine(name, p, weeklyCritical = false) {
   if (!p) return `${name.padEnd(6)} n/a`;
-  return `${name.padEnd(6)} 5h ${pct(p.fiveHourPct)} · week ${pct(p.weeklyPct)} · `
-       + `spent ${fmtTok(p.spentToday)} today / ${fmtTok(p.spent7d)} 7d`;
+  const mark = weeklyCritical ? ' ⚠' : '';
+  const used = (p.spentToday == null && p.spent7d == null)
+    ? 'used n/a'
+    : `used ${fmtTok(p.spentToday)} today / ${fmtTok(p.spent7d)} 7d`;
+  return `${name.padEnd(6)} 5h ${pctLeft(p.fiveHourPct)} · week ${pctLeft(p.weeklyPct)}${mark} · ${used}`;
 }
 
 export function formatSnapshot(state, nowMs) {
   const { mins, label } = ageStr(state?.generatedAt, nowMs);
   const stale = mins > 15 ? ' ⚠ stale — service may be down' : '';
+  const c = state?.claude, x = state?.codex;
+  // A critically-low *weekly* window (the constraining one) is marked inline so
+  // the eye lands on the exact problem. 5h-low is "use it or lose it", not a
+  // problem, so it never gets the ⚠.
+  const claudeCritical = weeklyIsConstraining(c, nowMs);
+  const codexCritical = weeklyIsConstraining(x, nowMs);
   const lines = [
-    providerLine('Claude', state?.claude),
-    providerLine('Codex', state?.codex),
+    providerLine('Claude', c, claudeCritical),
+    providerLine('Codex', x, codexCritical),
     `(${label}${stale})`,
   ];
 
   // (a) 5h use-it-or-lose-it note when 5h is below WATCH_PCT
-  const c = state?.claude;
   const fiveHourPct = c?.fiveHourPct ?? null;
   if (fiveHourPct != null && fiveHourPct < WATCH_PCT) {
     const resetNote = fiveHourResetNote(c?.fiveHourResetsAt, nowMs);
     lines.push(`↻ 5h window low (${fiveHourPct}%)${resetNote} — doesn't bank, spend freely`);
   }
 
-  // (b) weekly trend note when trending dry
-  const trend = c?.weeklyTrend;
-  if (trend?.willRunDryBeforeReset) {
+  // (b) THE ACTIONABLE VERDICT — when Claude's weekly is the constraint, name it,
+  // its remaining headroom, the trend, AND where to offload. This is the
+  // conclusion (don't make the reader infer it from raw numbers, which is exactly
+  // how 9%-remaining got misread as 9%-spent on 2026-06-27).
+  if (claudeCritical) {
+    const trendSuffix = (c.weeklyPct < WATCH_PCT && c?.weeklyTrend?.willRunDryBeforeReset)
+      ? ', on track to run dry before reset' : '';
+    lines.push(`⚠ Claude is the constraint — ${c.weeklyPct}% week left${trendSuffix}. ${routingAdvice(x?.weeklyPct)}`);
+  } else if (c?.weeklyTrend?.willRunDryBeforeReset) {
+    // trending dry but not yet critical — the soft heads-up
     lines.push('weekly trending down — on track to run dry before reset');
   }
 
@@ -142,12 +160,44 @@ export function formatSnapshot(state, nowMs) {
 const RESET_SOON_MIN = 90;       // minutes (already existed)
 const FLOOR_PCT = 12;             // "approaching 10%" critical floor
 const WATCH_PCT = 30;             // below this + trending dry → critical warn
+const CODEX_HEALTHY_PCT = 50;     // ≥ this weekly → safe to offload heavy work to
 const TREND_LOOKBACK_MIN = 180;   // prune history older than this
 const TREND_MIN_SPAN_MIN = 20;    // need at least this span of usable points
 
 function resetsSoon(resetEpoch, nowMs) {
   if (resetEpoch == null) return false;
   return (resetEpoch * 1000 - nowMs) < RESET_SOON_MIN * 60000;
+}
+
+/**
+ * weeklyIsConstraining — single source of truth for "is this provider's WEEKLY
+ * window the bottleneck right now?". A window is constraining when it is low
+ * enough to matter AND not about to reset the problem away:
+ *   - weeklyPct < FLOOR_PCT (hard floor, ~10%), OR
+ *   - weeklyPct < WATCH_PCT AND its trend projects running dry before reset,
+ *   - and in BOTH cases the weekly window is NOT resetting soon.
+ * Pure, null-safe, never throws. Shared by formatSnapshot (glance) and
+ * formatIfBelow (pre-big-op gate) so the two never disagree about what's critical.
+ */
+export function weeklyIsConstraining(p, nowMs) {
+  try {
+    if (!p || p.weeklyPct == null) return false;
+    if (resetsSoon(p.weeklyResetsAt, nowMs)) return false;
+    if (p.weeklyPct < FLOOR_PCT) return true;
+    if (p.weeklyPct < WATCH_PCT && p?.weeklyTrend?.willRunDryBeforeReset === true) return true;
+    return false;
+  } catch { return false; }
+}
+
+/**
+ * routingAdvice — the single offload sentence, shared by glance + gate so the
+ * advice never drifts. If Codex has healthy weekly headroom, name the number and
+ * say route there; otherwise advise frugality (there's nowhere to offload).
+ */
+export function routingAdvice(codexWeeklyPct) {
+  return (codexWeeklyPct != null && codexWeeklyPct >= CODEX_HEALTHY_PCT)
+    ? `Codex has ${codexWeeklyPct}% left — route heavy/parallel work there.`
+    : 'Be deliberate before any big token spend; consider lower effort / batching.';
 }
 
 /**
@@ -212,30 +262,21 @@ export function formatIfBelow(state, threshold, nowMs) {
   try {
     const c = state?.claude, x = state?.codex;
 
-    const claudeWeeklyPct = c?.weeklyPct ?? null;
-    const claudeWeeklyReset = c?.weeklyResetsAt ?? null;
-    const claudeWeeklyResetSoon = resetsSoon(claudeWeeklyReset, nowMs);
+    // Same predicate the glance uses — the gate and the glance must agree.
+    if (!weeklyIsConstraining(c, nowMs)) return '';
 
-    if (claudeWeeklyPct == null || claudeWeeklyResetSoon) return '';
-
+    const claudeWeeklyPct = c.weeklyPct;
     const trend = c?.weeklyTrend ?? null;
-    const floorTrigger = claudeWeeklyPct < FLOOR_PCT;
-    const trendTrigger = claudeWeeklyPct < WATCH_PCT && trend?.willRunDryBeforeReset === true;
-
-    if (!floorTrigger && !trendTrigger) return '';
-
-    const trendSuffix = trendTrigger ? ', on track to run dry before reset' : '';
+    const trendSuffix = (claudeWeeklyPct < WATCH_PCT && trend?.willRunDryBeforeReset === true)
+      ? ', on track to run dry before reset' : '';
     const codexWeeklyPct = x?.weeklyPct ?? null;
-    const codexWeeklyHealthy = codexWeeklyPct != null && codexWeeklyPct >= 50;
+    const codexWeeklyHealthy = codexWeeklyPct != null && codexWeeklyPct >= CODEX_HEALTHY_PCT;
 
+    const advice = routingAdvice(codexWeeklyPct);
     const lines = [
       `⚠ Claude weekly critically low (${claudeWeeklyPct}%)${trendSuffix}`,
+      codexWeeklyHealthy ? `Claude is the constraint; ${advice}` : advice,
     ];
-    if (codexWeeklyHealthy) {
-      lines.push('Claude is the constraint; Codex has idle budget. Prefer routing heavy/parallel work to Codex.');
-    } else {
-      lines.push('Be deliberate before any big token spend; consider lower effort / batching.');
-    }
 
     const { label } = ageStr(state?.generatedAt, nowMs);
     lines.push(`(${label})`);
