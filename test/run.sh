@@ -67,6 +67,14 @@ expect_exit "advise exit 0" 0 "$rc"
 contains "$OUT" "SITUATION / DECISION / CONTEXT" "advise prompt carries the advisor framing"
 contains "$OUT" "queue or direct calls"          "advise prompt carries the decision"
 
+echo "== scout mode =="
+SR="$WORK/scoutrepo"; mkdir -p "$SR"   # scout requires --repo to be an existing dir
+OUT="$(printf 'where does retry/backoff live, and what calls it?' | "$WRAP" --mode scout --repo "$SR" --effort low 2>/dev/null)"; rc=$?
+expect_exit "scout exit 0" 0 "$rc"
+contains "$OUT" "WHAT TO SCOUT FOR"   "scout prompt carries the scout framing"
+contains "$OUT" "retry/backoff"       "scout prompt carries the recon task"
+printf 'x' | "$WRAP" --mode scout --repo "$SR/nope" >/dev/null 2>&1; expect_exit "scout: missing --repo dir rejected" 2 $?
+
 echo "== diff happy path + untracked inclusion =="
 R="$WORK/repo"; mkdir -p "$R"
 ( cd "$R" && git init -q && git config user.email t@t && git config user.name t \

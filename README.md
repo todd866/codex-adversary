@@ -11,8 +11,10 @@ the lead looks harder.
 It works on **code** (local git diffs and branch diffs) and on **prose** (a manuscript, a
 research claim, an argument, a design doc).
 
-Codex plays two roles: an **adversarial reviewer** (retrospective — tear apart finished work)
-and an **advisor** (prospective — a second opinion on a decision *before* you act).
+Codex plays three roles: an **adversarial reviewer** (retrospective — tear apart finished work),
+an **advisor** (prospective — a second opinion on a decision *before* you act), and a **scout**
+(read-only recon that hands back a compressed target map, so exploration spends Codex's budget
+instead of Claude's).
 
 > **One honest caveat up front:** Codex and Claude are both transformer LLMs trained on
 > overlapping data, so this is *correlated* diversity, not independence. Agreement reduces
@@ -35,7 +37,7 @@ Three small pieces, plus an installer:
 
 | Piece | Role |
 |-------|------|
-| `bin/codex-adversary.sh` | Runs Codex **read-only** and prints only its output (clean capture via `codex exec --output-last-message`). Modes: `--mode prose` (content on stdin/`--file`), `--mode diff` (uncommitted + staged + untracked changes, or `--base <branch>`), and `--mode advise` (a decision + context on stdin; `--repo .` adds codebase context). |
+| `bin/codex-adversary.sh` | Runs Codex **read-only** and prints only its output (clean capture via `codex exec --output-last-message`). Modes: `--mode prose` (content on stdin/`--file`), `--mode diff` (uncommitted + staged + untracked changes, or `--base <branch>`), `--mode advise` (a decision + context on stdin; `--repo .` adds codebase context), and `--mode scout` (a recon task on stdin; reads `--repo` and returns a compressed target map). |
 | `skills/adversarial-review/SKILL.md` | **Review** pattern: run Claude's own review **and** Codex, then synthesize. Auto-activates on review / red-team / second-eyes passes. |
 | `skills/codex-advisor/SKILL.md` | **Advisor** pattern: at a consequential, uncertain fork, get Codex's second opinion *before* acting, then weigh it and decide. |
 | `commands/adversarial-review.md` · `commands/codex-advisor.md` | `/adversarial-review [target]` and `/codex-advisor [decision]` for explicit one-shot use. |
@@ -64,6 +66,17 @@ hard-to-reverse design choice, an ambiguous spec, a risky or irreversible step, 
 domain), it consults Codex for a second opinion *before* acting, then weighs it and decides.
 Same rule — Codex advises, Claude decides — and the bar is high, so it won't fire on routine
 choices. Codex is a *different* model's perspective, not a bigger/smarter one.
+
+## The scout role
+
+`--mode scout` is neither review nor advice — it's **recon to conserve Claude's budget**. Claude
+hands Codex a targeting question ("where does X live, and what calls it?"); Codex reads the repo
+read-only and returns a *compressed* map — the relevant files with line-ranges, where to start,
+the load-bearing gotchas, and what to skip — instead of an analysis. Claude then acts on a tight
+brief having spent almost no tokens exploring. The win is real only because the map is small:
+Codex does the wide reading, Claude reads the conclusions. Pair it with the budget hooks below —
+when Claude's weekly window is low, route exploration to Codex rather than burning Claude tokens
+on it. Unlike the other two roles this is *not* about diversity of thought; it's about who pays.
 
 ## Requirements
 
@@ -103,6 +116,9 @@ To install into a non-default location: `CLAUDE_HOME=/path/to/.claude ./install.
   # advise — a second opinion on a decision before acting
   echo "Queue vs direct calls between A and B? Leaning queue. What am I missing?" \
       | ~/.claude/bin/codex-adversary.sh --mode advise --repo .
+  # scout — read-only recon that returns a compressed target map (conserves Claude budget)
+  echo "where does retry/backoff live, and what calls it?" \
+      | ~/.claude/bin/codex-adversary.sh --mode scout --repo .
   ```
 
 ## Budget awareness

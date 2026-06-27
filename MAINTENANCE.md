@@ -48,7 +48,7 @@ Tested against **Codex CLI 0.139.0**. Run `codex-adversary.sh --doctor` to check
 ## When you bump the supported Codex version
 
 1. `./bin/codex-adversary.sh --doctor` — confirm all flags present.
-2. `./test/run.sh` (stubbed) plus one live `--mode prose` and `--mode diff` smoke.
+2. `./test/run.sh` (stubbed) plus one live `--mode prose`, `--mode diff`, and `--mode scout` smoke.
 3. Update "Tested against …" here and in `README.md`.
 4. Note it in `CHANGELOG.md`.
 

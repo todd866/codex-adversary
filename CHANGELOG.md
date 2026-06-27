@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.0 — 2026-06-27
+
+- **`--mode scout`** on the wrapper: read-only reconnaissance that returns a *compressed target
+  map* (relevant files + line-ranges, start order, load-bearing gotchas, what to skip) for a
+  downstream agent — so codebase exploration spends Codex's budget instead of Claude's. Roots
+  Codex in `--repo` (default: cwd); task on stdin or `--file`. Same read-only sandbox and
+  version-drift hardening as the other modes. A third role alongside reviewer/advisor — about
+  *who pays for exploration*, not diversity of thought.
+- **diff-mode performance fix:** replace the bash `${RAW//[…]/}` whitespace strip (pathologically
+  O(n²) on bash 3.2 — pins a CPU for minutes on large diffs) with a `grep` here-string emptiness
+  check (and a note on why a pipe would false-negative under `pipefail`).
+- **Tests:** add a stubbed `--mode scout` happy-path check (framing + task carried into the prompt).
+
 ## v0.4.0 — 2026-06-24
 
 Adds **budget awareness** — live rate-limit visibility for both Codex and Claude

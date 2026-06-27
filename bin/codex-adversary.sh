@@ -29,17 +29,23 @@
 #   echo "<the decision + context>" | codex-adversary.sh --mode advise --repo . \
 #       --focus "Which migration strategy, and what am I missing?"
 #
+#   # Scout — read-only recon of a codebase that returns a COMPRESSED target map
+#   # for a downstream agent (cheap targeting instead of expensive exploration):
+#   echo "where is rate-limit handling, and what calls it?" | \
+#       codex-adversary.sh --mode scout --repo .
+#
 # OPTIONS
-#   --mode   prose|diff|advise  prose/diff = adversarial review; advise = counsel on a
-#                            decision before acting. Default: prose.
+#   --mode   prose|diff|advise|scout  prose/diff = adversarial review; advise = counsel
+#                            on a decision before acting; scout = read-only recon that
+#                            returns a compressed target map. Default: prose.
 #   --effort low|medium|high|xhigh
 #                            Codex reasoning effort. Default: high.
 #                            (Claude picks this per-pass; see the skill's rubric.)
 #   --focus  "..."           Optional extra instruction / the specific question.
-#   --file   PATH            (prose/advise) Read content from PATH instead of stdin.
+#   --file   PATH            (prose/advise/scout) Read content from PATH instead of stdin.
 #   --base   BRANCH          (diff) Review changes vs BRANCH instead of uncommitted.
-#   --repo   DIR             (diff) repo to diff; (advise) codebase given to Codex as
-#                            read-only context. Default: current directory.
+#   --repo   DIR             (diff) repo to diff; (advise/scout) codebase given to Codex
+#                            as read-only context. Default: current directory.
 #   --model  NAME            Override Codex model. Default: inherit ~/.codex config.
 #   --timeout SECS           Hard cap on the Codex call. Default: 600.
 #   --doctor                 Check Codex availability + flag compatibility, then exit.
@@ -112,7 +118,7 @@ done
 case "$TIMEOUT" in (*[!0-9]*|'') die_usage "--timeout must be a positive integer (seconds): $TIMEOUT" ;; esac
 [ "$TIMEOUT" -ge 1 ] || die_usage "--timeout must be at least 1 second: $TIMEOUT"
 
-case "$MODE" in prose|diff|advise) ;; *) die_usage "--mode must be prose, diff, or advise" ;; esac
+case "$MODE" in prose|diff|advise|scout) ;; *) die_usage "--mode must be prose, diff, advise, or scout" ;; esac
 case "$EFFORT" in low|medium|high|xhigh) ;; *) die_usage "--effort must be low|medium|high|xhigh" ;; esac
 
 command -v codex >/dev/null 2>&1 || { echo "codex-adversary.sh: codex CLI not found on PATH" >&2; exit 3; }
@@ -179,6 +185,8 @@ CODE_FRAMING='You are an adversarial code reviewer — a skeptical senior engine
 
 ADVISE_FRAMING='You are a senior technical advisor giving a SECOND OPINION on a decision someone faces mid-task, BEFORE they act. They — not you — will decide and act; you cannot make changes. From the situation and any context below: (1) restate the decision as you understand it, in one line; (2) lay out the main viable options; (3) the key tradeoffs and the risks or edge-cases they are most likely missing; (4) a concrete recommended approach, with your reasoning; (5) call out anything that would make their apparent current plan a mistake. Be specific and decisive — surface considerations a single perspective would miss rather than hedging everything. Focus on what could make the plan wrong or costly; ignore cosmetic preferences. If the situation is underspecified, state the assumption your advice depends on instead of refusing to answer.'
 
+SCOUT_FRAMING='You are a fast reconnaissance scout for another AI agent that will do the actual work. You have READ-ONLY access to a codebase; USE it — grep, read files, trace structure — to LOCATE what the downstream agent needs, then hand back a compressed targeting map, NOT an analysis, fix, or solution. Your output is consumed by another agent and spends its budget, so be terse and decision-ready: no preamble, no restating the task, no essays, no pasting large code blocks. Report ONLY: (1) the specific files with line-ranges/symbols that are relevant, each with a one-line why; (2) where to START and in what order; (3) load-bearing facts the agent must know before touching it (invariants, gotchas, the real entry point vs decoys); (4) what looks relevant but is NOT, so the agent can skip it. If you cannot locate something, say so in one line rather than guessing. Aim for under ~400 words; a tight annotated list beats prose. Map the territory; do not conquer it.'
+
 build_codex_cmd() {
   # Essential (preflighted): read-only sandbox + clean capture via --output-last-message.
   CODEX_CMD=(codex exec --sandbox read-only)
@@ -239,6 +247,27 @@ elif [ "$MODE" = "advise" ]; then
     CODEX_CMD+=(-C "$TMPDIR_RUN")  # no codebase context requested
   fi
 
+elif [ "$MODE" = "scout" ]; then
+  CONTENT_FILE="$TMPDIR_RUN/content.txt"
+  if [ -n "$FILE" ]; then
+    [ -f "$FILE" ] || die_usage "--file not found: $FILE"
+    cat "$FILE" > "$CONTENT_FILE" || die_usage "could not read --file: $FILE"
+  else
+    cat > "$CONTENT_FILE"   # the scouting task, on stdin
+  fi
+  LC_ALL=C grep -q '[^[:space:]]' "$CONTENT_FILE" || { echo "codex-adversary.sh: no scouting task provided on stdin/--file" >&2; exit 2; }
+  [ -d "$REPO" ] || die_usage "--repo is not a directory: $REPO"
+  {
+    printf '%s\n' "$SCOUT_FRAMING"
+    [ -n "$FOCUS" ] && printf '\nNarrow the scout to: %s\n' "$FOCUS"
+    printf '\nCodebase to scout (read-only): %s\n' "$REPO"
+    printf '\n--- WHAT TO SCOUT FOR ---\n\n'
+    cat "$CONTENT_FILE"
+    printf '\n'
+  } > "$PROMPT_FILE"
+  build_codex_cmd
+  CODEX_CMD+=(-C "$REPO")
+
 else  # diff mode
   git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die_usage "--repo is not a git repo: $REPO"
   # --no-ext-diff / --no-textconv: never run repo-configured external diff or
@@ -268,7 +297,11 @@ $(git -C "$REPO" diff --no-index --no-color --no-ext-diff --no-textconv -- /dev/
     DIFF_TEXT="$(printf '===== UNSTAGED CHANGES (working tree vs index) =====\n%s\n\n===== STAGED CHANGES (index vs HEAD) =====\n%s\n\n===== UNTRACKED (new) FILES =====\n%s\n' "$UNSTAGED" "$STAGED" "$UNTRACKED")"
     SCOPE="uncommitted changes (unstaged + staged + untracked)"
   fi
-  [ -n "${RAW//[$' \t\n\r']/}" ] || { echo "codex-adversary.sh: no $SCOPE to review in $REPO" >&2; exit 2; }
+  # NB: do NOT use ${RAW//[ws]/} here — bash 3.2's global pattern substitution is
+  # pathologically slow (~O(n^2)) on large diffs and pins a CPU for minutes. Use grep
+  # via a here-string (NOT a pipe: with `set -o pipefail`, grep -q's early exit would
+  # SIGPIPE the writer and report a false "no changes").
+  LC_ALL=C grep -q '[^[:space:]]' <<<"$RAW" || { echo "codex-adversary.sh: no $SCOPE to review in $REPO" >&2; exit 2; }
   {
     printf '%s\n' "$CODE_FRAMING"
     printf '\nScope: %s. Working directory: %s\n' "$SCOPE" "$REPO"
