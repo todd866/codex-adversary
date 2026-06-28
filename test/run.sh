@@ -37,6 +37,9 @@ case "${STUB_MODE:-ok}" in
   hang)  sleep 30 ;;
   fail)  echo "stub: simulated failure" >&2; exit 1 ;;
   empty) : > "${out:-/dev/null}"; exit 0 ;;
+  # json: emit a verdict array wrapped in prose + a markdown fence, to prove the
+  # judge mode extracts clean compact JSON out of a realistically-messy response.
+  json) printf 'Here are the verdicts:\n```json\n[{"id":"a","ok":true},{"id":"b","ok":false}]\n```\nDone.\n' > "${out:-/dev/stdout}" ;;
   *)     { printf 'STUB_OK\n'; printf '%s\n' "$input"; } > "${out:-/dev/stdout}" ;;
 esac
 exit 0
@@ -74,6 +77,27 @@ expect_exit "scout exit 0" 0 "$rc"
 contains "$OUT" "WHAT TO SCOUT FOR"   "scout prompt carries the scout framing"
 contains "$OUT" "retry/backoff"       "scout prompt carries the recon task"
 printf 'x' | "$WRAP" --mode scout --repo "$SR/nope" >/dev/null 2>&1; expect_exit "scout: missing --repo dir rejected" 2 $?
+
+echo "== judge mode =="
+JR="$WORK/judgerepo"; mkdir -p "$JR"
+WL="$WORK/worklist.json"; printf '[{"id":"a","front":"x"},{"id":"b","front":"y"}]' > "$WL"
+SCH="$WORK/schema.json"; printf '{"id":"<id>","verdict":"keep|fix","note":"<why>"}' > "$SCH"
+# strict-fail: a prose (non-JSON) codex response -> exit 4, raw + prompt dumped to stderr.
+EJ="$WORK/judge.err"
+"$WRAP" --mode judge --file "$WL" --schema "$SCH" --focus "is each card too easy?" --repo "$JR" --effort low </dev/null >/dev/null 2>"$EJ"; rc=$?
+expect_exit "judge: non-JSON codex output -> 4" 4 "$rc"
+contains "$(cat "$EJ")" "WORKLIST TO JUDGE"        "judge prompt carries the judge framing"
+contains "$(cat "$EJ")" "is each card too easy?"   "judge prompt carries the rubric focus"
+contains "$(cat "$EJ")" "keep|fix"                 "judge prompt carries the output schema"
+contains "$(cat "$EJ")" '"id":"a"'                 "judge prompt carries the worklist"
+# happy path: messy (fenced + prose-wrapped) JSON -> wrapper returns clean compact JSON.
+OJ="$(STUB_MODE=json "$WRAP" --mode judge --file "$WL" --schema "$SCH" --effort low </dev/null 2>/dev/null)"; rc=$?
+expect_exit "judge: json output -> 0" 0 "$rc"
+contains "$OJ" '[{"id":"a","ok":true},{"id":"b","ok":false}]' "judge extracts clean compact JSON"
+if printf '%s' "$OJ" | grep -q '```'; then bad "judge strips markdown fences"; else ok "judge strips markdown fences"; fi
+if printf '%s' "$OJ" | grep -q 'Here are the verdicts'; then bad "judge strips surrounding prose"; else ok "judge strips surrounding prose"; fi
+# judge requires content (worklist) — empty -> usage error
+"$WRAP" --mode judge --repo "$JR" </dev/null 2>/dev/null; expect_exit "judge: empty worklist rejected" 2 $?
 
 echo "== diff happy path + untracked inclusion =="
 R="$WORK/repo"; mkdir -p "$R"

@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.0 — 2026-06-28
+
+**`--mode judge`** — the structured-judging offload primitive. Every token-heavy
+LLM-judge loop (factual audit, too-easy/augment, acronym-decode, premortem) can now
+spend Codex's budget instead of Claude's: feed a worklist + rubric (`--focus`) +
+output shape (`--schema`), Codex judges each item — reading `--repo` READ-ONLY to
+verify claims against the real source — and returns ONE validated JSON array a
+downstream record/apply step can consume directly.
+
+- `JUDGE_FRAMING` demands strict per-item JSON (one object per input item, same
+  order, carrying the id; uncertainty recorded, never dropped/reordered).
+- Output is extracted + validated: strips a ```json fence / surrounding prose,
+  slices the outermost JSON value, re-emits it COMPACT. Non-JSON ⇒ exit 4 with the
+  raw response on stderr — a machine consumer never gets fed prose.
+- `--schema PATH` embeds the required verdict shape; `--repo` gives read-only
+  source context to verify against (default: no codebase context).
+- +10 stubbed tests (prompt assembly, strict-fail→4, fenced/prose-wrapped JSON
+  extraction, empty-worklist→2). 42/42 green.
+- Exercised live on real Codex against 2 user-flagged md3 cards: it read the source
+  read-only and independently caught a card flag that rested on a cow's-milk-protein
+  vs lactose-intolerance conceptual conflation (ruled keep-as-is, high confidence).
+
 ## v0.5.1 — 2026-06-28
 
 Budget-snapshot **disambiguation + actionable verdict** — after a reader (a model)

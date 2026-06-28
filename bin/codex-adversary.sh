@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# codex-adversary.sh — run Codex (your configured model) as a READ-ONLY
-# adversarial reviewer and print ONLY its findings to stdout.
+# codex-adversary.sh — run Codex (your configured model) READ-ONLY as a second
+# model — adversarial reviewer, advisor, scout, or batch judge — and print ONLY
+# its output to stdout.
 #
-# This is the primitive behind the `adversarial-review` skill. Claude calls it
-# alongside its own review agents, then reconciles both — a second model from a
-# different vendor catches errors a single reviewer's blind spots would miss.
+# This is the primitive behind the `adversarial-review` skill (review/advise) and
+# the budget-offload path (scout/judge): a second model from a different vendor
+# catches errors a single reviewer's blind spots would miss, AND — for judge mode —
+# lets a token-heavy judging pass spend Codex's budget instead of Claude's.
 #
 # SAFETY: --sandbox read-only means Codex cannot WRITE your files. It can still
 # READ them, and the content you review is SENT to your configured Codex/model
@@ -34,18 +36,30 @@
 #   echo "where is rate-limit handling, and what calls it?" | \
 #       codex-adversary.sh --mode scout --repo .
 #
+#   # Judge — OFFLOAD a batch LLM-judge loop to Codex: feed a worklist + rubric +
+#   # output shape, Codex judges each item (reading --repo read-only to verify) and
+#   # returns ONE validated JSON array for a downstream record/apply step. This is
+#   # how a token-heavy judging pass spends Codex's budget instead of Claude's.
+#   codex-adversary.sh --mode judge --file worklist.json --schema shape.json \
+#       --repo . --focus "Is each cloze too easy for a Year-3 student?" > verdicts.json
+#
 # OPTIONS
-#   --mode   prose|diff|advise|scout  prose/diff = adversarial review; advise = counsel
-#                            on a decision before acting; scout = read-only recon that
-#                            returns a compressed target map. Default: prose.
+#   --mode   prose|diff|advise|scout|judge  prose/diff = adversarial review; advise =
+#                            counsel on a decision before acting; scout = read-only recon
+#                            returning a compressed target map; judge = structured batch
+#                            judging that returns validated JSON. Default: prose.
 #   --effort low|medium|high|xhigh
 #                            Codex reasoning effort. Default: high.
 #                            (Claude picks this per-pass; see the skill's rubric.)
-#   --focus  "..."           Optional extra instruction / the specific question.
-#   --file   PATH            (prose/advise/scout) Read content from PATH instead of stdin.
+#   --focus  "..."           Optional extra instruction / the specific question / the
+#                            (judge) rubric for the pass.
+#   --file   PATH            (prose/advise/scout/judge) Read content/worklist from PATH
+#                            instead of stdin.
+#   --schema PATH            (judge) Read the required JSON output shape from PATH and
+#                            instruct Codex to conform every verdict object to it.
 #   --base   BRANCH          (diff) Review changes vs BRANCH instead of uncommitted.
-#   --repo   DIR             (diff) repo to diff; (advise/scout) codebase given to Codex
-#                            as read-only context. Default: current directory.
+#   --repo   DIR             (diff) repo to diff; (advise/scout/judge) codebase given to
+#                            Codex as read-only context. Default: current directory.
 #   --model  NAME            Override Codex model. Default: inherit ~/.codex config.
 #   --timeout SECS           Hard cap on the Codex call. Default: 600.
 #   --doctor                 Check Codex availability + flag compatibility, then exit.
@@ -65,6 +79,7 @@ MODE="prose"
 EFFORT="high"
 FOCUS=""
 FILE=""
+SCHEMA=""
 BASE=""
 REPO="$(pwd)"
 REPO_EXPLICIT=0
@@ -103,6 +118,7 @@ while [ $# -gt 0 ]; do
     --effort)  need_val "$#" "$1"; EFFORT="$2"; shift 2 ;;
     --focus)   need_val "$#" "$1"; FOCUS="$2"; shift 2 ;;
     --file)    need_val "$#" "$1"; FILE="$2"; shift 2 ;;
+    --schema)  need_val "$#" "$1"; SCHEMA="$2"; shift 2 ;;
     --base)    need_val "$#" "$1"; BASE="$2"; shift 2 ;;
     --repo)    need_val "$#" "$1"; REPO="$2"; REPO_EXPLICIT=1; shift 2 ;;
     --model)   need_val "$#" "$1"; MODEL="$2"; shift 2 ;;
@@ -118,7 +134,7 @@ done
 case "$TIMEOUT" in (*[!0-9]*|'') die_usage "--timeout must be a positive integer (seconds): $TIMEOUT" ;; esac
 [ "$TIMEOUT" -ge 1 ] || die_usage "--timeout must be at least 1 second: $TIMEOUT"
 
-case "$MODE" in prose|diff|advise|scout) ;; *) die_usage "--mode must be prose, diff, advise, or scout" ;; esac
+case "$MODE" in prose|diff|advise|scout|judge) ;; *) die_usage "--mode must be prose, diff, advise, scout, or judge" ;; esac
 case "$EFFORT" in low|medium|high|xhigh) ;; *) die_usage "--effort must be low|medium|high|xhigh" ;; esac
 
 command -v codex >/dev/null 2>&1 || { echo "codex-adversary.sh: codex CLI not found on PATH" >&2; exit 3; }
@@ -184,6 +200,8 @@ PROSE_FRAMING='You are an adversarial referee at a journal-referee bar. Report O
 CODE_FRAMING='You are an adversarial code reviewer — a skeptical senior engineer. Report ONLY substantive problems: correctness/logic bugs, security holes, broken or unhandled edge cases, race conditions, resource leaks, data loss, and materially wrong design. Do NOT report style, formatting, naming, import order, lint, or "consider/you might want to" preferences — those are noise here and listing them is a failure. Trace the actual logic and data flow; prefer ONE real, deep bug over ten shallow remarks. You have read-only access to the repo — read surrounding files for context. Order findings by severity, most serious first; for each: file:line, what breaks and the concrete input/case that triggers it, why it matters, and a fix. If there is no substantive problem, say exactly that in one sentence.'
 
 ADVISE_FRAMING='You are a senior technical advisor giving a SECOND OPINION on a decision someone faces mid-task, BEFORE they act. They — not you — will decide and act; you cannot make changes. From the situation and any context below: (1) restate the decision as you understand it, in one line; (2) lay out the main viable options; (3) the key tradeoffs and the risks or edge-cases they are most likely missing; (4) a concrete recommended approach, with your reasoning; (5) call out anything that would make their apparent current plan a mistake. Be specific and decisive — surface considerations a single perspective would miss rather than hedging everything. Focus on what could make the plan wrong or costly; ignore cosmetic preferences. If the situation is underspecified, state the assumption your advice depends on instead of refusing to answer.'
+
+JUDGE_FRAMING='You are a careful, skeptical JUDGE adjudicating a BATCH of items against a rubric, so a downstream automated pipeline can act on your verdicts. If a codebase was provided you have READ-ONLY access to it — USE it to VERIFY each claim against the actual source/data before ruling; do not rule from memory when the source can be checked. For EACH item in the worklist, apply the rubric and produce exactly one verdict object. Output ONLY a single JSON array and NOTHING else — no preamble, no prose, no markdown code fences, no trailing commentary. The array MUST contain exactly one object per input item, in the SAME order, and each object MUST carry the item identifier so verdicts can be matched back. Conform every object to the OUTPUT SHAPE given below. If you are uncertain about an item, still emit its object and record the uncertainty in its fields (a confidence/flag/note) — never drop, merge, invent, or reorder items. When the rubric specifies a default (e.g. default-reject, default-uncertain), apply it. Correctness over leniency; your output is parsed by a machine, so malformed JSON or extra prose is a failure.'
 
 SCOUT_FRAMING='You are a fast reconnaissance scout for another AI agent that will do the actual work. You have READ-ONLY access to a codebase; USE it — grep, read files, trace structure — to LOCATE what the downstream agent needs, then hand back a compressed targeting map, NOT an analysis, fix, or solution. Your output is consumed by another agent and spends its budget, so be terse and decision-ready: no preamble, no restating the task, no essays, no pasting large code blocks. Report ONLY: (1) the specific files with line-ranges/symbols that are relevant, each with a one-line why; (2) where to START and in what order; (3) load-bearing facts the agent must know before touching it (invariants, gotchas, the real entry point vs decoys); (4) what looks relevant but is NOT, so the agent can skip it. If you cannot locate something, say so in one line rather than guessing. Aim for under ~400 words; a tight annotated list beats prose. Map the territory; do not conquer it.'
 
@@ -268,6 +286,42 @@ elif [ "$MODE" = "scout" ]; then
   build_codex_cmd
   CODEX_CMD+=(-C "$REPO")
 
+elif [ "$MODE" = "judge" ]; then
+  # Structured batch judging — the offload primitive for LLM-judge loops that feed
+  # an automated record/apply step. Codex judges each worklist item against a
+  # rubric (optionally reading the repo read-only to verify) and returns JSON.
+  CONTENT_FILE="$TMPDIR_RUN/content.txt"
+  if [ -n "$FILE" ]; then
+    [ -f "$FILE" ] || die_usage "--file not found: $FILE"
+    cat "$FILE" > "$CONTENT_FILE" || die_usage "could not read --file: $FILE"
+  else
+    cat > "$CONTENT_FILE"   # the worklist (items to judge), on stdin
+  fi
+  LC_ALL=C grep -q '[^[:space:]]' "$CONTENT_FILE" || { echo "codex-adversary.sh: no worklist provided on stdin/--file" >&2; exit 2; }
+  if [ -n "$SCHEMA" ]; then
+    [ -f "$SCHEMA" ] || die_usage "--schema not found: $SCHEMA"
+  fi
+  {
+    printf '%s\n' "$JUDGE_FRAMING"
+    [ -n "$FOCUS" ] && printf '\nRubric for this pass: %s\n' "$FOCUS"
+    if [ -n "$SCHEMA" ]; then
+      printf '\n--- OUTPUT SHAPE (emit exactly this JSON structure, one object per item) ---\n\n'
+      cat "$SCHEMA"
+      printf '\n'
+    fi
+    [ "$REPO_EXPLICIT" = "1" ] && printf '\nCodebase available read-only at %s — verify claims against it before ruling.\n' "$REPO"
+    printf '\n--- WORKLIST TO JUDGE (one verdict object per item, same order) ---\n\n'
+    cat "$CONTENT_FILE"
+    printf '\n'
+  } > "$PROMPT_FILE"
+  build_codex_cmd
+  if [ "$REPO_EXPLICIT" = "1" ]; then
+    [ -d "$REPO" ] || die_usage "--repo is not a directory: $REPO"
+    CODEX_CMD+=(-C "$REPO")        # give Codex the codebase as read-only context to verify against
+  else
+    CODEX_CMD+=(-C "$TMPDIR_RUN")  # judge the worklist as given, no codebase context
+  fi
+
 else  # diff mode
   git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die_usage "--repo is not a git repo: $REPO"
   # --no-ext-diff / --no-textconv: never run repo-configured external diff or
@@ -334,7 +388,36 @@ if [ "$RC" -ne 0 ]; then
   [ -s "$OUT_FILE" ] && { echo "--- partial findings (treated as failure) ---" >&2; cat "$OUT_FILE" >&2; }
   exit 4
 fi
+# judge mode: Codex was told to emit a JSON array. Real responses sometimes wrap it
+# in prose or a ```json fence, so extract the outermost JSON value, validate it
+# parses, and emit it COMPACT for the downstream record step. On any failure, dump
+# the raw response to stderr and exit 4 — never feed prose to a machine consumer.
+emit_judge_json() {
+  local raw_file="$1" cleaned
+  if ! command -v node >/dev/null 2>&1; then
+    echo "codex-adversary.sh: judge mode needs 'node' to validate JSON; emitting raw response unvalidated." >&2
+    cat "$raw_file"; return 0
+  fi
+  if cleaned="$(node -e '
+    const fs=require("fs");
+    let s=fs.readFileSync(process.argv[1],"utf8").trim();
+    s=s.replace(/^```(?:json)?\s*/i,"").replace(/```\s*$/,"").trim();
+    const cands=[s.indexOf("["),s.indexOf("{")].filter(i=>i>=0);
+    if(!cands.length) process.exit(3);
+    const start=Math.min(...cands), close=s[start]==="[" ? "]" : "}", end=s.lastIndexOf(close);
+    if(end<start) process.exit(3);
+    try { process.stdout.write(JSON.stringify(JSON.parse(s.slice(start,end+1)))); }
+    catch(e){ process.exit(3); }
+  ' "$raw_file" 2>/dev/null)"; then
+    printf '%s\n' "$cleaned"; return 0
+  fi
+  echo "codex-adversary.sh: judge mode — Codex did not return parseable JSON (effort=$EFFORT). Raw response follows on stderr." >&2
+  echo "--- raw codex response ---" >&2; cat "$raw_file" >&2
+  return 4
+}
+
 if [ -s "$OUT_FILE" ]; then
+  if [ "$MODE" = "judge" ]; then emit_judge_json "$OUT_FILE"; exit $?; fi
   cat "$OUT_FILE"
   exit 0
 fi
