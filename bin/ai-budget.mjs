@@ -3,9 +3,11 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSy
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { summariseCodexRateLimits, looksLikeRateLimitLine,
+import { summariseCodexRateLimits, looksLikeRateLimitLine, parseCodexRetryAt, shouldProbeCodex,
          sumClaudeTranscriptTokens, parseClaudeUsageWindows, formatSnapshot, formatIfBelow,
          projectWeeklyTrend, pickClaudeWindows } from './ai-budget-lib.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const HOME = homedir();
 const STATE = join(HOME, '.claude', '.cache', 'ai-budget.json');
@@ -102,9 +104,44 @@ async function claudeWindows(nowEpoch) {
   } catch { return null; }
 }
 
+// The Codex model whose admission we actually care about — the one codex-adversary.sh runs.
+// A cheaper model proves nothing: gpt-5.6-luna was served while the general limit read 100%.
+const PROBE_MODEL = process.env.CODEX_PROBE_MODEL || 'gpt-5.6-sol';
+const PROBE_TIMEOUT_MS = 30_000;
+
+// Ask Codex the only question its telemetry cannot answer: will you take a new turn?
+// One trivial request at the lowest effort. Distinguishes three outcomes, and NEVER reports a
+// crash, a timeout, or a missing binary as a refusal — that would stand an agent down on no
+// evidence, the exact failure this whole exercise was about.
+function probeCodex(nowMs) {
+  let dir;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'codex-probe-'));
+    execFileSync('codex', [
+      'exec', '--sandbox', 'read-only', '--ephemeral', '--skip-git-repo-check',
+      '-C', dir, '-m', PROBE_MODEL, '-c', 'model_reasoning_effort=low',
+      'Reply with exactly: OK',
+    ], { stdio: ['ignore', 'pipe', 'pipe'], timeout: PROBE_TIMEOUT_MS, encoding: 'utf8' });
+    return { at: nowMs, status: 'serving', model: PROBE_MODEL, retryAt: null };
+  } catch (e) {
+    const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`;
+    if (/usage limit|rate.?limit|\b429\b/i.test(out)) {
+      return { at: nowMs, status: 'refusing', model: PROBE_MODEL, retryAt: parseCodexRetryAt(out, nowMs) };
+    }
+    // ENOENT, timeout (e.signal === 'SIGTERM'), auth failure, anything else: we learned nothing.
+    return { at: nowMs, status: 'unknown', model: PROBE_MODEL, retryAt: null, detail: e?.code ?? e?.signal ?? null };
+  } finally {
+    if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } }
+  }
+}
+
 async function refresh() {
   const nowMs = Date.now(), nowEpoch = Math.floor(nowMs / 1000);
   const codexRL = summariseCodexRateLimits(recentCodexSessionLines(), nowEpoch);
+  // refresh() runs every 60s; the probe is throttled, and a believed refusal is not re-tested
+  // until the retry time Codex itself named.
+  const prevProbe = readState()?.codex?.probe ?? null;
+  const codexProbe = shouldProbeCodex(prevProbe, nowMs) ? probeCodex(nowMs) : prevProbe;
   const tlines = allTranscriptLines();
   const claudeSpend = sumClaudeTranscriptTokens(tlines, nowMs);
   const freshWin = await claudeWindows(nowEpoch);
@@ -139,7 +176,11 @@ async function refresh() {
       weeklyTrend,
       spentToday: claudeSpend.todayUncached, spent7d: claudeSpend.sevenDayUncached,
     },
-    codex: codexRL ? { ...codexRL, spentToday: null, spent7d: null } : null,
+    // The probe stands alone: it is meaningful even when the rate-limit telemetry is absent,
+    // and it is the only field here that reflects a decision the server actually made.
+    codex: (codexRL || codexProbe)
+      ? { ...(codexRL ?? {}), probe: codexProbe, spentToday: null, spent7d: null }
+      : null,
   };
   try {
     mkdirSync(join(HOME, '.claude', '.cache'), { recursive: true });

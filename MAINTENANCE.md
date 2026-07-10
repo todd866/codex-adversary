@@ -86,10 +86,20 @@ Tested against **Codex CLI 0.144.1**. Run `codex-adversary.sh --doctor` to check
    glance renders it as `5h 0-100% left`. That looks uninformative because it *is* — which is
    the honest state of this data. Nothing gates on it.
 
-   **The only reliable check is a cheap call with the model you will actually run:**
-   `codex exec -m gpt-5.6-sol -c model_reasoning_effort=low ... "Reply: OK"`. Luna and
-   `codex_bengalfox` were both served while the general limit read 100%, so a cheap-model probe
-   proves nothing about Sol.
+   **The only reliable check is a cheap call with the model you will actually run** — which is
+   what `probeCodex()` in `bin/ai-budget.mjs` does, once per 10 minutes, from `refresh` (never
+   from a session hook). Luna and `codex_bengalfox` were both served while the general limit read
+   100%, so a cheap-model probe proves nothing about Sol; keep `PROBE_MODEL` equal to the
+   wrapper's `DEFAULT_MODEL`.
+
+   Three invariants there are load-bearing:
+   - **`unknown` must never render or behave as `refusing`.** ENOENT, a timeout, an auth error —
+     none are evidence about quota. Standing an agent down on them is the bug this replaced.
+   - **A refusal is believed until the retry time Codex named** (`parseCodexRetryAt` reads
+     *"try again at 1:19 PM"* out of the error). Re-probing earlier only burns a request.
+   - **The probe never runs on a hook path.** `SessionStart` and `PreToolUse` call
+     `ai-budget.mjs read`, which only prints the cache; the launchd agent calls `refresh`.
+     If you ever move the probe onto a hook, every tool call pays for a network round-trip.
 
 ## When you bump the supported Codex version
 

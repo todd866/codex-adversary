@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.7.3 — 2026-07-10
+
+**`ai-budget` now measures Codex availability instead of inferring it.** v0.7.2 established that
+`rate_limits` cannot answer "will my next call be served" (`used_percent = 100` while Sol was
+being served). A call can answer it, so the glance makes one.
+
+- **Liveness probe.** `refresh` runs one trivial `codex exec -m gpt-5.6-sol -c
+  model_reasoning_effort=low "Reply with exactly: OK"` in a temp dir, read-only and ephemeral,
+  and records `serving` / `refusing` / `unknown`. The Codex line now leads with the verdict:
+  `Codex  sol REFUSED — retry 13:19 · week 69-100% left`.
+- **The model matters.** It probes `gpt-5.6-sol` — the model `codex-adversary.sh` actually runs —
+  because `gpt-5.6-luna` and `codex_bengalfox` were both served while the general limit read
+  100% used. Override with `CODEX_PROBE_MODEL`.
+- **Codex names its own reset.** The refusal carries *"try again at 1:19 PM"*, which
+  `parseCodexRetryAt` reads. That is a better reset signal than any `resets_at` in the logs,
+  because the server computed it against the decision it just made.
+- **Throttled.** `refresh` runs every 60s; the probe runs at most every 10 minutes, and a refusal
+  that named a retry time is *believed* until that time passes — no request is burned to be told
+  the same thing twice.
+- **`unknown` is not `refusing`.** A timeout, a missing binary, an auth failure: none of these are
+  evidence about quota, and none of them stand an agent down. Only an actual usage-limit response
+  does. This is the failure mode the whole v0.7.1–v0.7.2 episode was about.
+- **A refusing probe vetoes the Codex-offload advice.** Weekly headroom is irrelevant if the next
+  turn will not be admitted. `unknown` does not veto.
+
 ## v0.7.2 — 2026-07-10
 
 **Retracts the budget-window selection rule in v0.7.1. There is no governing window, and no

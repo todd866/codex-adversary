@@ -206,15 +206,18 @@ function windowStr(min, max) {
   return `${min}-${max}% left`;
 }
 
-function providerLine(name, p, weeklyCritical = false) {
+function providerLine(name, p, weeklyCritical = false, nowMs = Date.now()) {
   if (!p) return `${name.padEnd(6)} n/a`;
   const mark = weeklyCritical ? ' ⚠' : '';
   const used = (p.spentToday == null && p.spent7d == null)
     ? 'used n/a'
     : `used ${fmtTok(p.spentToday)} today / ${fmtTok(p.spent7d)} 7d`;
-  const five = windowStr(p.fiveHourPct, p.fiveHourPctMax);
   const week = windowStr(p.weeklyPct, p.weeklyPctMax);
-  return `${name.padEnd(6)} 5h ${five} · week ${week}${mark} · ${used}`;
+  // For Codex the 5h `used_percent` is not evidence about servability (it read 100% while
+  // Sol was being served), so the probe result takes that slot. Claude's window is real.
+  const first = p.probe ? formatCodexProbe(p.probe, nowMs)
+                        : `5h ${windowStr(p.fiveHourPct, p.fiveHourPctMax)}`;
+  return `${name.padEnd(6)} ${first} · week ${week}${mark} · ${used}`;
 }
 
 export function formatSnapshot(state, nowMs) {
@@ -227,8 +230,8 @@ export function formatSnapshot(state, nowMs) {
   const claudeCritical = weeklyIsConstraining(c, nowMs);
   const codexCritical = weeklyIsConstraining(x, nowMs);
   const lines = [
-    providerLine('Claude', c, claudeCritical),
-    providerLine('Codex', x, codexCritical),
+    providerLine('Claude', c, claudeCritical, nowMs),
+    providerLine('Codex', x, codexCritical, nowMs),
     `(${label}${stale})`,
   ];
 
@@ -246,7 +249,7 @@ export function formatSnapshot(state, nowMs) {
   if (claudeCritical) {
     const trendSuffix = (c.weeklyPct < WATCH_PCT && c?.weeklyTrend?.willRunDryBeforeReset)
       ? ', on track to run dry before reset' : '';
-    lines.push(`⚠ Claude is the constraint — ${c.weeklyPct}% week left${trendSuffix}. ${routingAdvice(x?.weeklyPct)}`);
+    lines.push(`⚠ Claude is the constraint — ${c.weeklyPct}% week left${trendSuffix}. ${routingAdvice(x?.weeklyPct, x?.probe)}`);
   } else if (c?.weeklyTrend?.willRunDryBeforeReset) {
     // trending dry but not yet critical — the soft heads-up
     lines.push('weekly trending down — on track to run dry before reset');
@@ -287,12 +290,76 @@ export function weeklyIsConstraining(p, nowMs) {
   } catch { return false; }
 }
 
+// --- Codex liveness probe -------------------------------------------------------
+// `rate_limits` cannot tell you whether a call will be served (see summariseCodexRateLimits).
+// A call can. These are the pure parts; the exec lives in ai-budget.mjs.
+
+export const PROBE_INTERVAL_MS = 10 * 60_000;   // refresh runs every 60s; probing is not free
+const PROBE_BACKOFF_MS = 10 * 60_000;
+
+// Codex's refusal names the wall-clock time it will serve again:
+//   "You've hit your usage limit. ... try again at 1:19 PM."
+// That is a far better reset signal than any `resets_at` in the logs, because the server
+// computed it. Returns epoch ms of the NEXT occurrence of that clock time, or null.
+export function parseCodexRetryAt(text, nowMs) {
+  if (typeof text !== 'string') return null;
+  const m = text.match(/try again at\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?/);
+  if (!m) return null;
+  let hour = Number(m[1]);
+  const min = Number(m[2]);
+  const mer = m[3]?.toLowerCase();
+  if (hour > 23 || min > 59) return null;
+  if (mer === 'pm' && hour !== 12) hour += 12;
+  if (mer === 'am' && hour === 12) hour = 0;
+  const d = new Date(nowMs);
+  d.setHours(hour, min, 0, 0);
+  let at = d.getTime();
+  if (at <= nowMs) at += 24 * 3600_000;   // already past today -> tomorrow
+  return at;
+}
+
+// Probe only when we would learn something. A refusal that named a retry time is believed
+// until that time passes — re-probing before then only burns a request to be told the same.
+export function shouldProbeCodex(probe, nowMs, intervalMs = PROBE_INTERVAL_MS) {
+  if (!probe || typeof probe.at !== 'number') return true;
+  if (probe.status === 'refusing') {
+    if (typeof probe.retryAt === 'number') return nowMs >= probe.retryAt;
+    return nowMs - probe.at >= PROBE_BACKOFF_MS;
+  }
+  return nowMs - probe.at >= intervalMs;   // 'serving' or 'unknown'
+}
+
+// One short phrase for the glance. `unknown` must never read like a refusal: a timeout or a
+// missing binary is not evidence about quota, and an agent that stands down on it is wrong.
+export function formatCodexProbe(probe, nowMs) {
+  if (!probe || typeof probe.at !== 'number') return 'probe n/a';
+  const mins = Math.round((nowMs - probe.at) / 60000);
+  const age = mins < 1 ? 'just now' : `${mins}m ago`;
+  const model = probe.model ? probe.model.replace(/^gpt-5\.6-/, '') : 'codex';
+  if (probe.status === 'serving') return `${model} serving ✓ (${age})`;
+  if (probe.status === 'refusing') {
+    if (typeof probe.retryAt === 'number') {
+      const t = new Date(probe.retryAt);
+      const hh = String(t.getHours()).padStart(2, '0'), mm = String(t.getMinutes()).padStart(2, '0');
+      return `${model} REFUSED — retry ${hh}:${mm}`;
+    }
+    return `${model} REFUSED (${age})`;
+  }
+  return `probe unknown (${age})`;
+}
+
 /**
  * routingAdvice — the single offload sentence, shared by glance + gate so the
  * advice never drifts. If Codex has healthy weekly headroom, name the number and
  * say route there; otherwise advise frugality (there's nowhere to offload).
+ *
+ * A refusing probe vetoes the offload outright: weekly headroom is irrelevant if the
+ * next turn will not be admitted. `unknown` does NOT veto — see formatCodexProbe.
  */
-export function routingAdvice(codexWeeklyPct) {
+export function routingAdvice(codexWeeklyPct, codexProbe = null) {
+  if (codexProbe?.status === 'refusing') {
+    return 'Codex is refusing new turns right now — keep the work here.';
+  }
   return (codexWeeklyPct != null && codexWeeklyPct >= CODEX_HEALTHY_PCT)
     ? `Codex has ${codexWeeklyPct}% left — route heavy/parallel work there.`
     : 'Be deliberate before any big token spend; consider lower effort / batching.';
@@ -370,7 +437,7 @@ export function formatIfBelow(state, threshold, nowMs) {
     const codexWeeklyPct = x?.weeklyPct ?? null;
     const codexWeeklyHealthy = codexWeeklyPct != null && codexWeeklyPct >= CODEX_HEALTHY_PCT;
 
-    const advice = routingAdvice(codexWeeklyPct);
+    const advice = routingAdvice(codexWeeklyPct, state?.codex?.probe);
     const lines = [
       `⚠ Claude weekly critically low (${claudeWeeklyPct}%)${trendSuffix}`,
       codexWeeklyHealthy ? `Claude is the constraint; ${advice}` : advice,

@@ -794,3 +794,66 @@ test('looksLikeRateLimitLine: matches both wrapper and bare-dict shapes, rejects
   assert.equal(looksLikeRateLimitLine(JSON.stringify({ type: 'agent_message', text: 'hi' })), false);
 });
 
+
+// --- Codex liveness probe --------------------------------------------------------------
+// rate_limits cannot say whether a call will be served; a call can. These guard the pure parts.
+import { parseCodexRetryAt, shouldProbeCodex, formatCodexProbe, PROBE_INTERVAL_MS }
+  from '../bin/ai-budget-lib.mjs';
+
+test('parseCodexRetryAt: reads the wall-clock retry time out of Codex\'s refusal', () => {
+  // 2026-07-10 09:44 local
+  const now = new Date(2026, 6, 10, 9, 44, 0).getTime();
+  const msg = "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
+            + "to purchase more credits or try again at 1:19 PM.";
+  const at = parseCodexRetryAt(msg, now);
+  const d = new Date(at);
+  assert.equal(d.getHours(), 13);
+  assert.equal(d.getMinutes(), 19);
+  assert.equal(d.getDate(), 10, 'same day when the time is still ahead');
+});
+
+test('parseCodexRetryAt: a time already past today rolls to tomorrow', () => {
+  const now = new Date(2026, 6, 10, 23, 0, 0).getTime();
+  const at = parseCodexRetryAt('try again at 1:19 AM', now);
+  assert.equal(new Date(at).getDate(), 11);
+});
+
+test('parseCodexRetryAt: 24h clock, and null on anything it cannot read', () => {
+  const now = new Date(2026, 6, 10, 9, 0, 0).getTime();
+  assert.equal(new Date(parseCodexRetryAt('try again at 13:19', now)).getHours(), 13);
+  assert.equal(parseCodexRetryAt('some other failure', now), null);
+  assert.equal(parseCodexRetryAt(undefined, now), null);
+  assert.equal(parseCodexRetryAt('try again at 99:99 PM', now), null);
+});
+
+test('shouldProbeCodex: throttles, and believes a refusal until its own retry time', () => {
+  const now = 1_800_000_000_000;
+  assert.equal(shouldProbeCodex(null, now), true, 'no prior probe -> probe');
+  assert.equal(shouldProbeCodex({ at: now - 60_000, status: 'serving' }, now), false, 'throttled');
+  assert.equal(shouldProbeCodex({ at: now - PROBE_INTERVAL_MS, status: 'serving' }, now), true);
+  // A refusal that named a retry time is believed: re-probing early only burns a request.
+  const refused = { at: now - 60_000, status: 'refusing', retryAt: now + 3600_000 };
+  assert.equal(shouldProbeCodex(refused, now), false, 'do not re-probe before the named retry');
+  assert.equal(shouldProbeCodex({ ...refused, retryAt: now - 1 }, now), true, 'retry time passed');
+  // A refusal with no parseable time backs off rather than hammering.
+  assert.equal(shouldProbeCodex({ at: now - 60_000, status: 'refusing', retryAt: null }, now), false);
+});
+
+test('formatCodexProbe: an unknown probe never reads as a refusal', () => {
+  const now = 1_800_000_000_000;
+  assert.match(formatCodexProbe({ at: now, status: 'serving', model: 'gpt-5.6-sol' }, now), /sol serving/);
+  assert.match(formatCodexProbe({ at: now, status: 'unknown', model: 'gpt-5.6-sol' }, now), /unknown/);
+  assert.doesNotMatch(formatCodexProbe({ at: now, status: 'unknown' }, now), /REFUS/i,
+    'a timeout or missing binary is not evidence about quota');
+  const r = formatCodexProbe({ at: now, status: 'refusing', model: 'gpt-5.6-sol', retryAt: now + 3600_000 }, now);
+  assert.match(r, /REFUSED — retry \d{2}:\d{2}/);
+  assert.equal(formatCodexProbe(null, now), 'probe n/a');
+});
+
+test('routingAdvice: a refusing probe vetoes the offload, unknown does not', () => {
+  assert.match(routingAdvice(90, { status: 'refusing' }), /keep the work here/);
+  assert.match(routingAdvice(90, { status: 'serving' }), /route heavy/);
+  assert.match(routingAdvice(90, { status: 'unknown' }), /route heavy/,
+    'no evidence of refusal must not suppress offload');
+  assert.match(routingAdvice(90, null), /route heavy/);
+});
