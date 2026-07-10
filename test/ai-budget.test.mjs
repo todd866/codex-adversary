@@ -754,7 +754,7 @@ test('pickGoverningRateLimits: an EXPIRED window is ignored, however recently wr
 
 // No consensus (every bucket a single vote) must NOT resolve to the furthest reset — that is
 // precisely the lone-outlier shape. With nothing to break the tie, be pessimistic.
-test('pickGoverningRateLimits: no consensus -> pessimistic, never the furthest reset', async () => {
+test('pickGoverningRateLimits: never the furthest reset — the drained window binds', async () => {
   const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
   const lines = [
@@ -767,7 +767,7 @@ test('pickGoverningRateLimits: no consensus -> pessimistic, never the furthest r
 
 // Greedy single-link chaining would fuse 20000..20360 into one four-vote bucket spanning
 // 360s, out-voting three genuine snapshots of the real window.
-test('pickGoverningRateLimits: chained resets do not manufacture a false plurality', async () => {
+test('pickGoverningRateLimits: many 0%-used instances cannot outweigh one drained window', async () => {
   const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
   const lines = [
@@ -780,7 +780,7 @@ test('pickGoverningRateLimits: chained resets do not manufacture a false plurali
 
 // Untagged events cannot be attributed to a plan. If ANY event is tagged, the untagged ones
 // are legacy (likely a pre-upgrade plan) and must not vote.
-test('pickGoverningRateLimits: untagged events cannot outvote plan-tagged ones', async () => {
+test('pickGoverningRateLimits: untagged events cannot mask a plan-tagged drained window', async () => {
   const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
   const R = now + 14385;
@@ -836,14 +836,14 @@ test('pickGoverningRateLimits: filters to the authenticated plan', async () => {
   assert.equal(unknown.fiveHourPct, 0, 'unknown plan -> worst across plans, not a guess');
 });
 
-// Observed 2026-07-10: every active session re-reports the live window each turn, so it
-// dominates by count, while a lone spurious instance reports a further reset at 0% used.
-// Selecting the furthest reset lands on that outlier and calls a drained quota empty.
-test('pickGoverningRateLimits: the consensus window wins over a further-reset outlier', async () => {
+// A lone spurious instance reporting a further-forward reset at 0% used is the most GENEROUS
+// reading, so the binding (most-used) window ignores it for free. Selecting by furthest reset,
+// or by consensus, needs extra machinery to reach the same answer.
+test('pickGoverningRateLimits: a further-reset 0%-used outlier cannot mask a drained window', async () => {
   const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
   const LIVE = now + 14000;
-  const OUTLIER = LIVE + 774;   // further forward, but reported once, at 0% used
+  const OUTLIER = LIVE + 774;
   const lines = [
     ...Array.from({ length: 12 }, () => rlLine('2026-07-10T01:18:00.000Z', 80, 13, LIVE)),
     rlLine('2026-07-10T01:18:30.000Z', 0, 0, OUTLIER),
@@ -851,6 +851,23 @@ test('pickGoverningRateLimits: the consensus window wins over a further-reset ou
   const r = pickGoverningRateLimits(lines, now);
   assert.equal(r.fiveHourPct, 20, 'furthest-reset selection would have reported 100% left');
   assert.equal(r.fiveHourResetsAt, LIVE);
+});
+
+// The 2026-07-10 shape: `codex`/`pro` carried TWO live 5h windows at once — one at used=29,
+// one at used=100 — each re-reported by the same 15 sessions. A Sol call was refused. The
+// question is never "which window do most sessions mention", it is "which one blocks me".
+test('pickGoverningRateLimits: with two live windows for one plan, the drained one binds', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const HEALTHY = now + 13000;   // used=29, and mentioned MORE often
+  const DRAINED = now + 14400;   // used=100
+  const lines = [
+    ...Array.from({ length: 20 }, () => rlLine('2026-07-10T02:03:00.000Z', 29, 5, HEALTHY)),
+    ...Array.from({ length: 3 },  () => rlLine('2026-07-10T02:03:20.000Z', 100, 16, DRAINED)),
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 0, 'a consensus rule would have reported 71% left while Sol was refused');
+  assert.equal(r.fiveHourResetsAt, DRAINED);
 });
 
 // Per-model quotas (codex_bengalfox = GPT-5.3-Codex-Spark) are always ~0% used and would

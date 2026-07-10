@@ -34,22 +34,28 @@ the `codex-rs` source at `rust-v0.144.1` and by live probe, not against prior no
     (`codexPlanFromIdToken`). A stale `prolite` window at 100% used shares the directory with
     the live `pro` window at 80%; only the authenticated plan governs our calls. Selecting the
     minimum across plans reported **0% left while calls were being served**;
-  - buckets the survivors into window instances by `resets_at` (±120s jitter) and takes the
-    **consensus** instance — every active session re-reports the live window each turn, so it
-    dominates by count, whereas a lone spurious instance reports a further-forward reset at 0%
-    used. Selecting the *furthest* reset lands on that outlier and reports a drained quota as
-    empty;
-  - within that instance takes the **highest `used_percent`** — inside a fixed window usage only
-    climbs, so the maximum is both the latest reading and the conservative one.
+  - then takes the **binding** window: the highest `used_percent` among unexpired instances.
+    Several windows are live at once for one plan — observed `codex`/`pro` carrying `used=29`
+    and `used=100` simultaneously, each re-reported by the same 15 sessions. The question is
+    not which window most sessions mention, it is which one **blocks the next call**. Any live
+    window at 100% refuses it, however few snapshots name it.
 
-  Where the data cannot decide, it now resolves **pessimistically** (three defects caught by
-  running this wrapper against its own diff, all failing in the optimistic direction):
-  - a **tie on votes** is not a consensus, so it no longer breaks toward the later reset — that
-    is precisely the lone-outlier shape it was meant to reject;
-  - **bucketing is anchored**, not single-link: chained resets `20000,20120,20240,20360` used to
-    fuse into one four-vote bucket spanning 360s and out-vote the real window;
-  - **untagged legacy events cannot out-vote attributable ones.** If any event carries
-    `limit_id`/`plan_type`, events lacking them are excluded rather than tolerated.
+  Within a fixed window `used_percent` only climbs and is never refunded — verified as **zero
+  in-session decreases across 37 sessions**. (Apparent decreases when the logs are sorted
+  globally are an artifact of interleaved writers, not evidence of a reservation-and-refund
+  scheme.) So the maximum is simultaneously the latest reading and the conservative one.
+
+  An intermediate version selected the window by *consensus* and then needed extra machinery to
+  defend that choice — against vote ties, single-link bucket chaining, and unattributable
+  votes. Codex found all three, running this wrapper against its own diff; all failed in the
+  optimistic direction. The binding minimum makes the whole class unreachable: a spurious
+  instance reporting a further-forward reset at 0% used is the most *generous* reading, so a
+  minimum ignores it for free. The one thing the minimum genuinely needs is the attribution
+  filter — without it, it latches onto the retired `prolite` plan's exhausted window.
+
+  Residual, stated plainly: nothing attributes a window instance to a **model**, so when two
+  live windows disagree we report the stricter. That errs toward caution and can under-report
+  headroom for a cheaper model. `gpt-5.6-luna` was served while the general limit read 100%.
 
   Verified against behaviour: at `19% left` a Sol call is served; at `0% left` Sol is refused with
   *"You've hit your usage limit."* The figure tracks the general `codex` limit for the

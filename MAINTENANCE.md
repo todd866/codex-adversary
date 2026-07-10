@@ -76,13 +76,21 @@ Tested against **Codex CLI 0.144.1**. Run `codex-adversary.sh --doctor` to check
      `id_token` governs your calls — hence `codexPlanFromIdToken`. If OpenAI moves that claim,
      the function returns `null`, the plan filter is skipped, and readings get pessimistic
      rather than wrong. Re-point it, don't remove it.
-   - **Several window instances coexist per plan.** Pick the *consensus* `resets_at` bucket,
-     not the furthest — a lone outlier reporting a further reset at 0% used will otherwise
-     report a drained quota as empty. Ties and unattributable events resolve pessimistically.
+   - **Several window instances are live at once per plan** (observed: `codex`/`pro` at
+     `used=29` and `used=100` simultaneously). Take the **binding** one — the highest
+     `used_percent` among unexpired instances. Any live window at 100% refuses the call,
+     however few snapshots name it. Do not select by consensus or by furthest reset; both
+     answer a question nobody asked, and both need machinery to avoid the optimistic failure.
+   - **`used_percent` never decreases within a session** (0 decreases / 37 sessions). There is
+     no reservation-and-refund scheme; usage accrues. If a future Codex *does* refund, the
+     `max()` would latch at the peak and under-report headroom for the rest of the window —
+     re-run the in-session monotonicity check before trusting it.
 
    The reported figure is the general `codex` limit, which gates `gpt-5.6-sol`. It does **not**
-   predict every model: Luna was served while that limit read 100% used. Treat the whole thing
-   as advisory; the only certain check is a cheap call **with the model you will actually run**:
+   predict every model: Luna and `codex_bengalfox` (*GPT-5.3-Codex-Spark*) were both served
+   while that limit read 100% used — which is why Codex appears to "keep working after running
+   out". Treat the whole thing as advisory; the only certain check is a cheap call **with the
+   model you will actually run**:
    `codex exec -m gpt-5.6-sol -c model_reasoning_effort=low ... "Reply: OK"`.
 
 ## When you bump the supported Codex version

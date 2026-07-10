@@ -50,10 +50,6 @@ export function looksLikeRateLimitLine(line) {
     || (line.includes('"primary"') && line.includes('"secondary"'));
 }
 
-// Two window snapshots belong to the same rolling window instance if their `resets_at`
-// agree to within this much; concurrent writers report the same window a second or two apart.
-const WINDOW_JITTER_SEC = 120;
-
 // The plan the CLI is authenticated as, read from the id_token's claims. This is the
 // discriminator that makes rate-limit telemetry usable at all (see below). Returns null
 // on anything unexpected — callers must treat that as "unknown", never as a match.
@@ -90,23 +86,33 @@ export function codexPlanFromIdToken(idToken) {
 //     sits in the same directory as the live "pro" window showing 75%. Taking the minimum
 //     across plans reports 0% left while calls are served; taking the newest reports
 //     whatever flushed last. Only the plan the CLI is AUTHENTICATED as governs its calls.
-//   - `resets_at` distinguishes window instances. Within one plan, several coexist: the live
-//     one, an about-to-expire earlier one, and occasional lone outliers reporting a further
-//     reset with 0% used. Picking the FURTHEST reset lands on those outliers and reports a
-//     drained quota as empty. Picking the CONSENSUS window is correct: every active session
-//     re-reports the live window on every turn, so it dominates by count, while a replayed
-//     or spurious instance appears a handful of times.
+//   - `resets_at` distinguishes window instances, and SEVERAL are live at once for one plan.
+//     Observed 2026-07-10: `codex`/`pro` carried a window at `used=29` and another at
+//     `used=100` simultaneously, each re-reported by the same 15 sessions.
 //
-// So: filter to our limit_id and our plan, bucket the surviving snapshots by window instance,
-// take the bucket the most snapshots agree on, and within it take the HIGHEST `used_percent`.
-// Within a fixed window `used_percent` only climbs, so the maximum is both the most recent
-// reading and the conservative one. Where the data cannot decide — a tie on votes, an event
-// that cannot be attributed to a plan — resolve PESSIMISTICALLY. Reporting less budget than
-// you have costs a cautious pass; reporting more sends a fan-out into a drained quota.
+// Given several live windows, the question is not "which one do most sessions mention" — it is
+// "which one BLOCKS the next call". Any live window at 100% refuses it, however few snapshots
+// name it. So after attribution we take the BINDING window: the highest `used_percent` among
+// unexpired instances. Within a fixed window `used_percent` only climbs and never refunds
+// (verified: zero in-session decreases across 37 sessions), so the maximum is simultaneously
+// the latest reading and the conservative one.
 //
-// Still advisory. The only certain check that budget remains is to make a cheap call.
+// This subsumes the outlier problem rather than solving it: a spurious instance reporting a
+// further-forward reset at 0% used is the most generous reading, so a minimum ignores it for
+// free. An earlier attempt selected a window by consensus and then had to defend that choice
+// against ties, chained buckets, and unattributable votes — scaffolding for a question that
+// did not need asking. The one thing the minimum genuinely needs is the attribution filter
+// above; without it, it latches onto a retired plan's exhausted window and reports 0% while
+// calls are being served.
+//
+// Residual, stated honestly: nothing in the payload attributes a window instance to a MODEL,
+// so when two live windows disagree we report the stricter. That errs toward caution — the
+// safe direction — and can under-report headroom for a cheaper model.
+//
+// Still advisory. The only certain check that budget remains is a cheap call with the model
+// you actually intend to run.
 export function pickGoverningRateLimits(lines, nowEpoch, opts = {}) {
-  const { plan = null, limitId = 'codex', jitterSec = WINDOW_JITTER_SEC } = opts;
+  const { plan = null, limitId = 'codex' } = opts;
 
   const parsed = [];
   for (const line of lines) {
@@ -131,45 +137,22 @@ export function pickGoverningRateLimits(lines, nowEpoch, opts = {}) {
   });
   if (!pool.length) return null;
 
-  // For one window ('primary' = 5h, 'secondary' = weekly): bucket unexpired snapshots into
-  // window instances, pick the instance the most snapshots agree on, then its worst reading.
-  const liveWindow = (key) => {
-    const wins = [];
+  // For one window ('primary' = 5h, 'secondary' = weekly): among unexpired instances, the one
+  // that binds is the most-used one. A window that has already reset cannot block anything.
+  const bindingWindow = (key) => {
+    let worst = null;
     for (const rl of pool) {
       const win = rl[key];
       if (!win || typeof win.resets_at !== 'number' || typeof win.used_percent !== 'number') continue;
-      if (win.resets_at <= nowEpoch) continue;   // already elapsed: not the live window
-      wins.push(win);
+      if (win.resets_at <= nowEpoch) continue;   // already elapsed
+      if (worst === null || win.used_percent > worst.used_percent) worst = win;
     }
-    if (!wins.length) return null;
-
-    // Bucket sorted resets_at into window instances. Compare against each bucket's ANCHOR,
-    // not its last member: single-link chaining would fuse 20000,20120,20240,20360 into one
-    // bucket spanning 360s, manufacturing a plurality that outvotes the real window.
-    wins.sort((a, b) => a.resets_at - b.resets_at);
-    const buckets = [];
-    for (const win of wins) {
-      const last = buckets[buckets.length - 1];
-      if (last && win.resets_at - last.anchor <= jitterSec) {
-        last.n++;
-        last.maxReset = win.resets_at;
-        if (win.used_percent > last.worstUsed) last.worstUsed = win.used_percent;
-      } else {
-        buckets.push({ n: 1, anchor: win.resets_at, maxReset: win.resets_at, worstUsed: win.used_percent });
-      }
-    }
-    // Consensus: the instance the most snapshots agree on. On a tie there IS no consensus, so
-    // take the most pessimistic bucket. Never break ties toward the later reset — a lone
-    // outlier at a further reset reporting 0% used is exactly the shape that produces it.
-    let best = null;
-    for (const b of buckets) {
-      if (best === null || b.n > best.n || (b.n === best.n && b.worstUsed > best.worstUsed)) best = b;
-    }
-    return { rem: Math.round(100 - best.worstUsed), resetsAt: best.maxReset };
+    if (!worst) return null;
+    return { rem: Math.round(100 - worst.used_percent), resetsAt: worst.resets_at };
   };
 
-  const p = liveWindow('primary');
-  const s = liveWindow('secondary');
+  const p = bindingWindow('primary');
+  const s = bindingWindow('secondary');
   if (!p && !s) return null;
 
   const weeklyResetsAt = s ? s.resetsAt : null;
