@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSy
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { parseCodexRateLimits, sumClaudeTranscriptTokens, parseClaudeUsageWindows,
+import { pickFreshestRateLimits, sumClaudeTranscriptTokens, parseClaudeUsageWindows,
          formatSnapshot, formatIfBelow, projectWeeklyTrend, pickClaudeWindows } from './ai-budget-lib.mjs';
 
 const HOME = homedir();
@@ -27,18 +27,26 @@ function writeHistory(history) {
   } catch { /* never crash refresh */ }
 }
 
-function newestCodexSessionLines() {
+// Lines from EVERY session touched recently — not just the newest file. Concurrent
+// Codex sessions (ChatGPT.app + CLI) report different window instances, so the
+// freshest rate-limit event can live in a file that is not the newest by mtime.
+// pickFreshestRateLimits() orders across them by each line's own timestamp.
+function recentCodexSessionLines(windowMs = 12 * 3600_000) {
   const root = join(HOME, '.codex', 'sessions');
   if (!existsSync(root)) return [];
-  let newest = null, newestMtime = 0;
+  const cutoff = Date.now() - windowMs;
+  const files = [];
   const walk = (dir) => { for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
     if (e.isDirectory()) walk(p);
-    else if (e.name.endsWith('.jsonl')) { const m = statSync(p).mtimeMs; if (m > newestMtime) { newestMtime = m; newest = p; } }
+    else if (e.name.endsWith('.jsonl') && statSync(p).mtimeMs >= cutoff) files.push(p);
   }};
   try { walk(root); } catch { return []; }
-  if (!newest) return [];
-  try { return readFileSync(newest, 'utf8').split('\n').filter(Boolean); } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    try { for (const l of readFileSync(f, 'utf8').split('\n')) if (l) out.push(l); } catch { /* skip */ }
+  }
+  return out;
 }
 
 function allTranscriptLines() {
@@ -77,7 +85,7 @@ async function claudeWindows(nowEpoch) {
 
 async function refresh() {
   const nowMs = Date.now(), nowEpoch = Math.floor(nowMs / 1000);
-  const codexRL = parseCodexRateLimits(newestCodexSessionLines(), nowEpoch);
+  const codexRL = pickFreshestRateLimits(recentCodexSessionLines(), nowEpoch);
   const tlines = allTranscriptLines();
   const claudeSpend = sumClaudeTranscriptTokens(tlines, nowMs);
   const freshWin = await claudeWindows(nowEpoch);

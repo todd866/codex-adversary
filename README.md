@@ -54,7 +54,8 @@ Claude reconciles the two reviews rather than concatenating them:
 
 ### Per-pass reasoning effort
 
-Claude chooses Codex's effort by stakes: `high` for routine passes, `xhigh` for high-stakes
+Claude chooses Codex's effort by stakes. Defaults are per-mode (prose/diff/advise=`ultra`,
+judge=`xhigh`, scout=`low`) on `gpt-5.6-sol`; `max` is depth without fan-out, `ultra` for high-stakes
 or subtle artifacts (final pre-merge / pre-submission passes, statistical or security-
 sensitive material).
 
@@ -108,7 +109,7 @@ To install into a non-default location: `CLAUDE_HOME=/path/to/.claude ./install.
 - **Standalone (bash):**
   ```bash
   # prose
-  cat draft.md | ~/.claude/bin/codex-adversary.sh --mode prose --effort xhigh \
+  cat draft.md | ~/.claude/bin/codex-adversary.sh --mode prose \
       --focus "scrutinise the statistical claims"
   # code (uncommitted changes, or vs a base branch)
   ~/.claude/bin/codex-adversary.sh --mode diff

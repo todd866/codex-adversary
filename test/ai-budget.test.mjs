@@ -675,3 +675,75 @@ test('pickClaudeWindows: freshWin null + prevState null → null', () => {
   const nowMs = Date.parse('2026-06-24T12:00:00Z');
   assert.equal(pickClaudeWindows(null, null, nowMs), null);
 });
+
+// --- freshest-event selection across interleaved sessions -----------------------
+// Regression: the reader used to pick the newest session FILE and take that file's
+// LAST rate_limits line. With the ChatGPT.app Codex and the CLI writing concurrently,
+// the newest file need not carry the newest EVENT — and the two report DIFFERENT
+// window instances (distinct resets_at). On 2026-07-10 this reported "17% left" while
+// the window actually governing CLI calls was 100% used. Select by event timestamp.
+
+const rlLine = (ts, primaryUsed, secondaryUsed, resetsAt = 1782314385) => JSON.stringify({
+  timestamp: ts,
+  type: 'event_msg',
+  payload: { type: 'token_count', rate_limits: {
+    primary:   { used_percent: primaryUsed,   window_minutes: 300,   resets_at: resetsAt },
+    secondary: { used_percent: secondaryUsed, window_minutes: 10080, resets_at: 1782358258 },
+  }},
+});
+
+test('pickFreshestRateLimits: newest EVENT wins even when it is not the last line', async () => {
+  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  // Lines concatenated from two sessions; the LAST line is the OLDER event.
+  const lines = [
+    rlLine('2026-07-10T00:16:19.728Z', 96, 15),  // newest event: 4% left
+    rlLine('2026-07-10T00:16:09.407Z', 16, 3),   // older event, appears last
+  ];
+  const r = pickFreshestRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 4, 'must take the newest event, not the last line');
+  assert.equal(r.weeklyPct, 85);
+});
+
+test('pickFreshestRateLimits: exhausted window reports 0, not a stale healthy number', async () => {
+  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const lines = [
+    rlLine('2026-07-10T00:10:00.000Z', 17, 3),    // stale "83% left"
+    rlLine('2026-07-10T00:17:00.000Z', 100, 16),  // truth: exhausted
+  ];
+  const r = pickFreshestRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 0);
+  assert.equal(r.weeklyPct, 84);
+});
+
+test('pickFreshestRateLimits: ignores lines with no timestamp, still finds the freshest', async () => {
+  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const untimed = JSON.stringify({ rate_limits: {
+    primary:   { used_percent: 1, window_minutes: 300,   resets_at: 1782314385 },
+    secondary: { used_percent: 1, window_minutes: 10080, resets_at: 1782358258 },
+  }});
+  const r = pickFreshestRateLimits([untimed, rlLine('2026-07-10T00:17:00.000Z', 90, 20)], now);
+  assert.equal(r.fiveHourPct, 10, 'a timestamped event outranks an untimed one');
+});
+
+test('pickFreshestRateLimits: falls back to last-wins when NO line carries a timestamp', async () => {
+  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const a = JSON.stringify({ rate_limits: {
+    primary:   { used_percent: 10, window_minutes: 300,   resets_at: 1782314385 },
+    secondary: { used_percent: 10, window_minutes: 10080, resets_at: 1782358258 },
+  }});
+  const b = JSON.stringify({ rate_limits: {
+    primary:   { used_percent: 40, window_minutes: 300,   resets_at: 1782314385 },
+    secondary: { used_percent: 40, window_minutes: 10080, resets_at: 1782358258 },
+  }});
+  const r = pickFreshestRateLimits([a, b], now);
+  assert.equal(r.fiveHourPct, 60, 'last-wins fallback preserves old behaviour');
+});
+
+test('pickFreshestRateLimits: returns null when there are no rate_limit events', async () => {
+  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  assert.equal(pickFreshestRateLimits(['{}', 'not json'], 1782300000), null);
+});

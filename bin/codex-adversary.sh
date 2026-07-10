@@ -48,9 +48,14 @@
 #                            counsel on a decision before acting; scout = read-only recon
 #                            returning a compressed target map; judge = structured batch
 #                            judging that returns validated JSON. Default: prose.
-#   --effort low|medium|high|xhigh
-#                            Codex reasoning effort. Default: high.
-#                            (Claude picks this per-pass; see the skill's rubric.)
+#   --effort low|medium|high|xhigh|max|ultra
+#                            Codex reasoning effort. `max` and `ultra` are CLI-side
+#                            tiers above xhigh (the server's reasoning.effort enum stops
+#                            at xhigh); `ultra` also delegates to concurrent subagents.
+#                            Default is PER-MODE: prose/diff/advise=ultra, judge=xhigh,
+#                            scout=low. (Claude picks this per-pass; see the skill rubric.)
+#                            Luna does not support ultra and is REFUSED rather than
+#                            silently downgraded.
 #   --focus  "..."           Optional extra instruction / the specific question / the
 #                            (judge) rubric for the pass.
 #   --file   PATH            (prose/advise/scout/judge) Read content/worklist from PATH
@@ -60,7 +65,9 @@
 #   --base   BRANCH          (diff) Review changes vs BRANCH instead of uncommitted.
 #   --repo   DIR             (diff) repo to diff; (advise/scout/judge) codebase given to
 #                            Codex as read-only context. Default: current directory.
-#   --model  NAME            Override Codex model. Default: inherit ~/.codex config.
+#   --model  NAME            Override Codex model. Default: gpt-5.6-sol, ALWAYS passed
+#                            explicitly — ~/.codex/config.toml is mutated by other Codex
+#                            clients, so inheriting it makes a review non-reproducible.
 #   --timeout SECS           Hard cap on the Codex call. Default: 600.
 #   --doctor                 Check Codex availability + flag compatibility, then exit.
 #   -h|--help                Show this help.
@@ -76,7 +83,8 @@
 set -uo pipefail
 
 MODE="prose"
-EFFORT="high"
+EFFORT=""            # empty => resolve a per-mode default after parsing
+EFFORT_SET=0
 FOCUS=""
 FILE=""
 SCHEMA=""
@@ -86,6 +94,29 @@ REPO_EXPLICIT=0
 MODEL=""
 TIMEOUT="600"
 DOCTOR=0
+
+# GPT-5.6 era. Sol is the frontier agentic-coding model; Terra is the balanced
+# everyday model; Luna is the fast/cheap one. `max` and `ultra` are CLI-side efforts
+# above `xhigh` (the SERVER's reasoning.effort enum stops at xhigh — the Codex CLI
+# translates them), and `ultra` additionally delegates to concurrent subagents.
+DEFAULT_MODEL="gpt-5.6-sol"
+VALID_EFFORTS="low medium high xhigh max ultra"
+
+# Per-mode default effort. Standing preference is Sol at `ultra`; the two downgrades
+# below are deliberate and specific, not timidity:
+#   scout — the mode exists to spend little and hand a downstream agent a target map.
+#           Running a fan-out reasoning tier to do recon defeats its entire purpose.
+#           (Sol's own default_reasoning_level is `low`.)
+#   judge — must emit ONE strict JSON array over N items. ultra's multi-agent synthesis
+#           adds output variance exactly where malformed JSON is fatal, and its fan-out
+#           multiplies per item across the batch.
+default_effort_for_mode() {
+  case "$1" in
+    scout) echo "low" ;;
+    judge) echo "xhigh" ;;
+    *)     echo "ultra" ;;   # prose, diff, advise
+  esac
+}
 
 die_usage() { echo "codex-adversary.sh: $1" >&2; echo "Run with --help for usage." >&2; exit 2; }
 # need_val CURRENT_ARGC FLAG — guard a `shift 2` so a value-less flag (e.g. a
@@ -109,13 +140,19 @@ doctor() {
     else echo "  flag $f: MISSING"; [ "$f" = "--output-last-message" ] && miss=1; fi
   done
   [ "$miss" = "0" ] || { echo "  => INCOMPATIBLE: --output-last-message is required (see MAINTENANCE.md)"; return 6; }
+  echo "  default model:  $DEFAULT_MODEL"
+  echo "  valid efforts:  $VALID_EFFORTS  (max/ultra are CLI-side; the server enum stops at xhigh)"
+  local m
+  for m in prose diff advise scout judge; do
+    printf '  default effort: %-7s %s\n' "$m" "$(default_effort_for_mode "$m")"
+  done
   echo "  => compatible. (Auth not checked here — run a real review to confirm 'codex login'.)"
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode)    need_val "$#" "$1"; MODE="$2"; shift 2 ;;
-    --effort)  need_val "$#" "$1"; EFFORT="$2"; shift 2 ;;
+    --effort)  need_val "$#" "$1"; EFFORT="$2"; EFFORT_SET=1; shift 2 ;;
     --focus)   need_val "$#" "$1"; FOCUS="$2"; shift 2 ;;
     --file)    need_val "$#" "$1"; FILE="$2"; shift 2 ;;
     --schema)  need_val "$#" "$1"; SCHEMA="$2"; shift 2 ;;
@@ -135,7 +172,21 @@ case "$TIMEOUT" in (*[!0-9]*|'') die_usage "--timeout must be a positive integer
 [ "$TIMEOUT" -ge 1 ] || die_usage "--timeout must be at least 1 second: $TIMEOUT"
 
 case "$MODE" in prose|diff|advise|scout|judge) ;; *) die_usage "--mode must be prose, diff, advise, scout, or judge" ;; esac
-case "$EFFORT" in low|medium|high|xhigh) ;; *) die_usage "--effort must be low|medium|high|xhigh" ;; esac
+
+[ "$EFFORT_SET" = "1" ] || EFFORT="$(default_effort_for_mode "$MODE")"
+case "$EFFORT" in low|medium|high|xhigh|max|ultra) ;; *) die_usage "--effort must be one of: $VALID_EFFORTS" ;; esac
+
+# Always send an explicit model. ~/.codex/config.toml is mutated by other Codex
+# clients (the ChatGPT.app Codex writes it), so inheriting the configured model makes
+# a review silently non-reproducible — you cannot tell from the output which model ran.
+[ -n "$MODEL" ] || MODEL="$DEFAULT_MODEL"
+
+# Luna advertises low..max and no `ultra`, but the CLI accepts `--effort ultra` on Luna
+# WITHOUT error — so a silent downgrade is indistinguishable from a real ultra run.
+# Refuse rather than let a caller believe they got delegation they never got.
+case "$MODEL:$EFFORT" in
+  *luna*:ultra) die_usage "model '$MODEL' does not support --effort ultra (Luna supports up to 'max'); Codex accepts it silently, so this is refused rather than downgraded. Use --effort max, or --model $DEFAULT_MODEL." ;;
+esac
 
 command -v codex >/dev/null 2>&1 || { echo "codex-adversary.sh: codex CLI not found on PATH" >&2; exit 3; }
 
@@ -219,7 +270,7 @@ build_codex_cmd() {
     else echo "codex-adversary.sh: note — this Codex build lacks $f; proceeding without it." >&2; fi
   done
   CODEX_CMD+=(-c model_reasoning_effort="$EFFORT" --output-last-message "$OUT_FILE")
-  [ -n "$MODEL" ] && CODEX_CMD+=(-m "$MODEL")
+  CODEX_CMD+=(-m "$MODEL")   # always explicit — never inherit a config another client mutates
 }
 
 if [ "$MODE" = "prose" ]; then

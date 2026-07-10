@@ -16,15 +16,7 @@ function windowRemaining(win, nowEpoch) {
   return Math.round(100 - win.used_percent);
 }
 
-export function parseCodexRateLimits(lines, nowEpoch) {
-  let rl = null;
-  for (const line of lines) {           // last line that carries rate_limits wins
-    let obj;
-    try { obj = JSON.parse(line); } catch { continue; }
-    const found = findRateLimits(obj);
-    if (found) rl = found;
-  }
-  if (!rl) return null;
+function rateLimitsToWindows(rl, nowEpoch) {
   const fiveHourResetsAt = rl.primary && typeof rl.primary.resets_at === 'number'
     && rl.primary.resets_at > nowEpoch ? rl.primary.resets_at : null;
   const weeklyResetsAt = rl.secondary && typeof rl.secondary.resets_at === 'number'
@@ -36,6 +28,47 @@ export function parseCodexRateLimits(lines, nowEpoch) {
     weeklyResetsAt,
     resetsAt: weeklyResetsAt,   // back-compat alias
   };
+}
+
+export function parseCodexRateLimits(lines, nowEpoch) {
+  let rl = null;
+  for (const line of lines) {           // last line that carries rate_limits wins
+    let obj;
+    try { obj = JSON.parse(line); } catch { continue; }
+    const found = findRateLimits(obj);
+    if (found) rl = found;
+  }
+  if (!rl) return null;
+  return rateLimitsToWindows(rl, nowEpoch);
+}
+
+// Select the rate-limit snapshot from the newest EVENT, by the line's own timestamp.
+//
+// Codex sessions are written concurrently (the ChatGPT.app Codex and the CLI both
+// append under ~/.codex/sessions), and they report DIFFERENT window instances —
+// distinct `resets_at` for the same limit_id. Picking the newest session *file* and
+// taking its last line therefore reads whichever session happened to flush last, not
+// the window that actually governs the next call. On 2026-07-10 that reported
+// "17% left" while the 5h window governing CLI calls was 100% used.
+//
+// Lines that carry no parseable timestamp cannot be ordered; a timestamped event
+// always outranks them, and they fall back to last-wins only when nothing is timed.
+export function pickFreshestRateLimits(lines, nowEpoch) {
+  let freshest = null, freshestTs = -Infinity, lastUntimed = null;
+  for (const line of lines) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { continue; }
+    const found = findRateLimits(obj);
+    if (!found) continue;
+    const ts = Date.parse(obj?.timestamp ?? '');
+    if (Number.isFinite(ts)) {
+      if (ts >= freshestTs) { freshestTs = ts; freshest = found; }
+    } else {
+      lastUntimed = found;
+    }
+  }
+  const chosen = freshest ?? lastUntimed;
+  return chosen ? rateLimitsToWindows(chosen, nowEpoch) : null;
 }
 
 export function sumClaudeTranscriptTokens(lines, nowMs) {

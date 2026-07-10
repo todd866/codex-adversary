@@ -33,13 +33,15 @@ read-only access to the codebase; `--focus` the precise question:
 
 ```bash
 printf '%s' "$DECISION_AND_CONTEXT" | ~/.claude/bin/codex-adversary.sh --mode advise \
-    --repo . --effort <high|xhigh> --focus "Which approach, and what am I missing?"
+    --repo . --focus "Which approach, and what am I missing?"
 ```
 
 Give it enough to be useful: what you're trying to do, the options you see, the constraints,
-and your current leaning. Use `xhigh` for genuinely hard or high-stakes forks, `high`
-otherwise. Codex returns: the decision restated, the main options, tradeoffs, the risks you're
-likely missing, and a recommendation.
+and your current leaning. `advise` defaults to **`gpt-5.6-sol` at `--effort ultra`** (maximum
+reasoning with automatic subagent delegation) — the right tier for a consequential fork. Drop to
+`--effort max` for a hard but single-threaded decision, or `high` under budget pressure. Codex
+returns: the decision restated, the main options, tradeoffs, the risks you're likely missing,
+and a recommendation.
 
 ## Using the advice (Claude has lead)
 

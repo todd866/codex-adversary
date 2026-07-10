@@ -32,6 +32,8 @@ case " $* " in
 esac
 out=""; prev=""
 for a in "$@"; do [ "$prev" = "--output-last-message" ] && out="$a"; prev="$a"; done
+# record the argv the wrapper actually built, so tests can assert on -m / -c values
+[ -n "${STUB_ARGV:-}" ] && printf '%s\n' "$*" > "$STUB_ARGV"
 input="$(cat)"
 case "${STUB_MODE:-ok}" in
   hang)  sleep 30 ;;
@@ -132,6 +134,44 @@ contains "$(cat "$WORK/e2")" "output-last-message" "explains the incompatibility
 echo "== doctor =="
 "$WRAP" --doctor >/dev/null 2>&1;                        expect_exit "doctor: compatible -> 0"   0 $?
 STUB_FLAGS='--sandbox' "$WRAP" --doctor >/dev/null 2>&1;  expect_exit "doctor: incompatible -> 6" 6 $?
+
+# --- GPT-5.6 era: max/ultra efforts, explicit model, Luna+ultra guard -------------
+echo "== effort allowlist (gpt-5.6 adds max + ultra) =="
+AV="$WORK/argv"
+for e in low medium high xhigh max ultra; do
+  printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode prose --effort "$e" >/dev/null 2>&1
+  expect_exit "--effort $e accepted" 0 $?
+  contains "$(cat "$AV")" "model_reasoning_effort=$e" "--effort $e reaches codex"
+done
+printf 'x' | "$WRAP" --mode prose --effort bogus >/dev/null 2>&1
+expect_exit "--effort bogus rejected (server enum has no such value)" 2 $?
+
+echo "== hermetic model: always pass -m explicitly =="
+# ~/.codex/config.toml is written concurrently by the ChatGPT.app Codex, so inheriting
+# the configured model makes a review silently non-reproducible. Always pass -m.
+printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode prose --effort low >/dev/null 2>&1
+contains "$(cat "$AV")" "-m gpt-5.6-sol" "prose defaults to an explicit -m gpt-5.6-sol"
+printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode prose --effort low --model gpt-5.6-terra >/dev/null 2>&1
+contains "$(cat "$AV")" "-m gpt-5.6-terra" "--model overrides the default"
+
+echo "== per-mode effort defaults =="
+printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode prose >/dev/null 2>&1
+contains "$(cat "$AV")" "model_reasoning_effort=ultra" "prose defaults to ultra"
+printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode advise >/dev/null 2>&1
+contains "$(cat "$AV")" "model_reasoning_effort=ultra" "advise defaults to ultra"
+SR2="$WORK/scoutrepo2"; mkdir -p "$SR2"
+printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode scout --repo "$SR2" >/dev/null 2>&1
+contains "$(cat "$AV")" "model_reasoning_effort=low" "scout defaults to low (cheap targeting is the mode's purpose)"
+STUB_MODE=json STUB_ARGV="$AV" "$WRAP" --mode judge --file "$WL" --schema "$SCH" </dev/null >/dev/null 2>&1
+contains "$(cat "$AV")" "model_reasoning_effort=xhigh" "judge defaults to xhigh (strict JSON at volume, no fan-out)"
+
+echo "== Luna + ultra guard =="
+# Luna advertises low..max — no ultra. The CLI accepts --effort ultra on Luna WITHOUT
+# error, so a silent downgrade is indistinguishable from success. Reject it loudly.
+printf 'x' | "$WRAP" --mode prose --model gpt-5.6-luna --effort ultra >/dev/null 2>&1
+expect_exit "luna + ultra rejected" 2 $?
+printf 'x' | "$WRAP" --mode prose --model gpt-5.6-luna --effort max >/dev/null 2>&1
+expect_exit "luna + max allowed (luna supports max)" 0 $?
 
 echo
 echo "passed: $PASS, failed: $FAIL"

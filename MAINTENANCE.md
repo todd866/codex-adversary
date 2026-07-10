@@ -5,7 +5,7 @@ the main thing that breaks as Codex evolves. The wrapper is built to **degrade g
 fail loudly** rather than silently. This doc maps each coupling point, how the wrapper handles
 a change today, and what to do if Codex changes it.
 
-Tested against **Codex CLI 0.139.0**. Run `codex-adversary.sh --doctor` to check your build.
+Tested against **Codex CLI 0.144.1**. Run `codex-adversary.sh --doctor` to check your build.
 
 ## The Codex surface we depend on
 
@@ -17,7 +17,7 @@ Tested against **Codex CLI 0.139.0**. Run `codex-adversary.sh --doctor` to check
 | `--ephemeral`, `--ignore-rules`, `--skip-git-repo-check` | hardening | each is **auto-dropped with a stderr note** if absent from `--help` (graceful) |
 | `-c model_reasoning_effort=<v>` | per-pass effort | generic config override; if the key is renamed, update `build_codex_cmd` |
 | `-C DIR` | root Codex in a repo / temp dir | stable; if renamed, update the prose/diff/advise branches |
-| `-m MODEL` | optional model override | only used with `--model` |
+| `-m MODEL` | model selection | **always** passed (default `gpt-5.6-sol`). `~/.codex/config.toml` is rewritten by other Codex clients (the ChatGPT.app Codex), so an inherited model is non-reproducible. If a slug is retired, update `DEFAULT_MODEL` |
 
 ## Anticipated breakage modes (and the fix)
 
@@ -32,8 +32,14 @@ Tested against **Codex CLI 0.139.0**. Run `codex-adversary.sh --doctor` to check
    value in `build_codex_cmd`; keep it read-only and re-verify Codex cannot write during a
    review (the safety claim in the README depends on it).
 4. **Effort values change** (e.g. `xhigh` dropped, or a model rejects it). The wrapper passes
-   the value verbatim. Update the `--effort` validation `case`, the skill's rubric, and
-   consider a `codex_supports`-style guard. A rejected effort currently surfaces as exit 4.
+   the value verbatim. Update the `--effort` validation `case` (`VALID_EFFORTS`), the skill's
+   rubric, and consider a `codex_supports`-style guard. A rejected effort surfaces as exit 4.
+   **This happened on 2026-07-09 (GPT-5.6):** `max` and `ultra` were added *above* `xhigh`.
+   They are **CLI-side** — the server's `reasoning.effort` enum is still
+   `none|minimal|low|medium|high|xhigh`, and an unknown value is passed straight through to a
+   400. Keep `VALID_EFFORTS` an explicit allowlist; do not relax it to "anything goes".
+   Note also that **Luna accepts `--effort ultra` without error despite not supporting it** —
+   a silent downgrade. The wrapper refuses that pair; re-check the guard when variants change.
 5. **Auth/login flow changes.** The wrapper doesn't touch auth; a logged-out Codex surfaces as
    **exit 4**. README troubleshooting points users at `codex login`.
 6. **`codex exec --help` output format changes** so `grep` misses a flag that is actually

@@ -23,11 +23,12 @@ check.)
 3. **In parallel, run Codex** via the wrapper:
    ```bash
    # prose / argument / claim:
-   cat draft.md | ~/.claude/bin/codex-adversary.sh --mode prose --effort <high|xhigh> \
+   cat draft.md | ~/.claude/bin/codex-adversary.sh --mode prose \
        --focus "<optional steer, e.g. 'scrutinise the AUC claim and its denominator'>"
+   # (defaults to gpt-5.6-sol at --effort ultra; add --effort max to drop the fan-out)
 
    # code / changes (Codex reads the repo + diff itself, read-only):
-   ~/.claude/bin/codex-adversary.sh --mode diff --effort <high|xhigh> --repo "$(pwd)"
+   ~/.claude/bin/codex-adversary.sh --mode diff --repo "$(pwd)"
    ~/.claude/bin/codex-adversary.sh --mode diff --base main           # vs a base branch
    ```
    Codex is **read-only** — it cannot modify files, so it is safe against any working
@@ -43,22 +44,35 @@ Large artifacts: the wrapper warns above ~400 KB but does not chunk. For a big d
 manuscript, split it (by file, by section) and run the pass per chunk — otherwise Codex
 may review it only partially, with no error.
 
-## Choosing Codex effort per-pass (you decide; pass via `--effort`)
+## Model and effort (GPT-5.6 era)
 
-The script defaults to `high`. Override per-artifact on **stakes × subtlety × length**:
+Codex runs **`gpt-5.6-sol`** — the frontier agentic-coding model — and the wrapper always
+passes it explicitly (`-m`). Never rely on `~/.codex/config.toml`: other Codex clients (the
+ChatGPT.app Codex) rewrite it, so an inherited model makes a review non-reproducible.
 
-- **`xhigh`** — high stakes or subtle reasoning. Pre-submission / pre-merge final
-  passes; statistical or methodological claims; ethics / regulatory / HREC wording;
-  security-sensitive diffs; arguments where being wrong is costly; anything you'd
-  want a careful journal referee on. **When torn between high and xhigh on something
-  you will submit or ship, choose xhigh.**
-- **`high`** (default) — routine review passes: moderate diffs, prose polish,
-  day-to-day critique, sanity-checking a section.
-- **`medium` / `low`** — rarely worth it for an adversarial pass; only for a quick
-  mechanical check where extra reasoning adds nothing.
+Two effort tiers now sit **above** `xhigh`. Both are **CLI-side** — the server's
+`reasoning.effort` enum stops at `xhigh`; the Codex CLI translates `max` and `ultra`.
 
-`xhigh` is slower (a few minutes on a large artifact). That's the right trade for a
-final referee pass; not for a quick gut-check.
+| Effort | What it is | Use when |
+|---|---|---|
+| **`ultra`** | Maximum reasoning **+ automatic delegation to concurrent subagents** | **The default** for `prose` / `diff` / `advise`. A hard, divisible target: a real diff, a manuscript, a consequential fork. |
+| **`max`** | Maximum reasoning depth, **single agent, no fan-out** | A hard problem that does *not* decompose — one gnarly proof, one subtle race. Also when you want depth without the fan-out cost. |
+| **`xhigh`** | Extra-high depth | **The default for `judge`.** Batch judging must emit one strict JSON array; `ultra`'s multi-agent synthesis adds output variance exactly where malformed JSON is fatal, and its fan-out multiplies per item. |
+| **`high`** / **`medium`** | Everyday depth | Deliberate downgrades under budget pressure, or a large batch where `xhigh` is overkill. |
+| **`low`** | Fast, light reasoning | **The default for `scout`.** Recon exists to spend little and hand a downstream agent a target map; a fan-out tier defeats its purpose. (Sol's own `default_reasoning_level` is `low`.) |
+
+**Standing preference: Sol at `ultra`, unless there is a *specific* reason to downgrade.**
+The specific reasons, all already wired as per-mode defaults: `scout` is cheap targeting;
+`judge` needs strict JSON at volume; a very large batch, or a drained 5h window, justifies
+dropping a tier. "It feels expensive" is not a specific reason.
+
+**Luna (`gpt-5.6-luna`) does not support `ultra`.** The CLI accepts `--effort ultra` on Luna
+*without erroring*, so a silent downgrade is indistinguishable from a real ultra run — the
+wrapper therefore **refuses** the combination rather than let you believe you got delegation
+you never got. Use `--effort max` on Luna, or switch to Sol.
+
+`ultra` is slower and fans out concurrent subagents. That's the right trade for a final
+referee pass on something you will ship; not for a quick gut-check.
 
 ## Synthesis contract (the actual value)
 
@@ -79,7 +93,7 @@ findings are inputs you weigh — never capitulate to them, never rubber-stamp t
   not persuasion).** Give the other model the specific counter-evidence — paste the repo
   lines that back a claim it called "unverifiable", or your reasoning for dismissing a
   finding — and ask it to **withdraw** (if the evidence genuinely refutes it) or **hold
-  and sharpen its reason**. Run at `--effort xhigh`. Evidence flows both ways, but the
+  and sharpen its reason**. Run at `--effort ultra` (or `max` if the point is single-threaded). Evidence flows both ways, but the
   decision is yours. Cap at one round (two for high-stakes). Outcomes:
   - **Withdraws** → resolved; drop it, noting it was triangulated.
   - **Holds and sharpens** → often the real finding (e.g. "the backing exists in the repo,

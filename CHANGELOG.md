@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.7.0 — 2026-07-10
+
+**GPT-5.6 (Sol / Terra / Luna).** OpenAI broadly released GPT-5.6 on 2026-07-09; Codex CLI
+`0.143.0` added the models plus two reasoning tiers above `xhigh`. Tested against `0.144.1`.
+
+- `--effort` now accepts **`max`** and **`ultra`**. Both are **CLI-side** tiers: the server's
+  `reasoning.effort` enum is still `none|minimal|low|medium|high|xhigh`, and an unknown value
+  is forwarded straight to a 400 — so `VALID_EFFORTS` stays an explicit allowlist.
+  `ultra` = maximum reasoning **plus automatic delegation to concurrent subagents**;
+  `max` = maximum depth, single agent, no fan-out.
+- **Per-mode default efforts** replace the flat `high`: `prose`/`diff`/`advise` → `ultra`,
+  `judge` → `xhigh` (strict single JSON array over N items; fan-out multiplies per item and
+  adds output variance where malformed JSON is fatal), `scout` → `low` (cheap targeting is
+  the mode's entire purpose; Sol's own `default_reasoning_level` is `low`).
+- **`-m` is now always passed**, defaulting to `gpt-5.6-sol`. `~/.codex/config.toml` is
+  rewritten by other Codex clients (the ChatGPT.app Codex), so an inherited model made a
+  review silently non-reproducible.
+- **Luna + `ultra` is refused.** Luna advertises `low..max` and no `ultra`, but the CLI
+  accepts `--effort ultra` on Luna *without erroring* — a silent downgrade indistinguishable
+  from a real ultra run. Exit 2 with a message rather than a false sense of delegation.
+- `--doctor` now reports the default model, the valid efforts, and each mode's default effort.
+- **`ai-budget`: select the freshest rate-limit EVENT, not the newest session FILE.**
+  Concurrent Codex sessions (ChatGPT.app + CLI) report different rolling-window instances
+  with different `resets_at`; picking the newest file read whichever session flushed last.
+  On 2026-07-10 that reported "17% left" against a window snapshot showing 100% used.
+  `pickFreshestRateLimits()` orders by each line's own `timestamp`.
+  *Caveat:* Codex rate-limit telemetry carries several concurrent window snapshots whose
+  `used_percent` disagree wildly at the same instant. Treat it as advisory — the only
+  reliable check that budget remains is whether a call is actually served.
+
+
 ## v0.6.0 — 2026-06-28
 
 **`--mode judge`** — the structured-judging offload primitive. Every token-heavy
