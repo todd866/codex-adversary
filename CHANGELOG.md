@@ -1,6 +1,75 @@
 # Changelog
 
+## v0.7.1 — 2026-07-10
+
+**Corrects two claims v0.7.0 got wrong, and makes `ultra` mean something.** Verified against
+the `codex-rs` source at `rust-v0.144.1` and by live probe, not against prior notes.
+
+- **`max` is a SERVER effort, not a CLI-side one.** `ReasoningEffort::as_str()` is documented
+  "the exact value used on the wire" and emits `"max"`; nothing maps it down to `xhigh`. A
+  live `-c model_reasoning_effort=max` call is served. **Only `ultra` is CLI-side:**
+  `client.rs::reasoning_effort_for_request()` maps `Ultra => Max` before the request.
+  (v0.7.0 claimed both were CLI-side and that the server enum stopped at `xhigh`.)
+- **`ultra` was inert.** Its sole extra effect is `MultiAgentMode::Proactive`, which
+  `effective_multi_agent_mode()` grants only when `multi_agent_version == V2` — i.e. only when
+  the `multi_agent_v2` feature is enabled, and it ships **off**. With it off, `ultra` and `max`
+  build **byte-identical requests**: every `prose`/`diff`/`advise` pass since v0.7.0 has in
+  fact run at `max` with no delegation. This is the exact failure the Luna guard exists to
+  prevent, on a gate the Luna guard never checked.
+  - The wrapper now **enables `features.multi_agent_v2` for the invocation** when `ultra` is
+    requested, and **exits 6 rather than silently downgrading** if it cannot.
+  - `ultra` is now an **opt-in**. Per-mode defaults for `prose`/`diff`/`advise` are **`max`** —
+    which is exactly what they were already sending. `Proactive` means the model is *permitted*
+    to delegate, not that subagents ran; never report a fan-out you did not observe.
+  - Read-only **is** inherited by spawned subagents (verified with a write canary), so `ultra`
+    remains safe against the working tree.
+- **`ai-budget` selects the governing window by limit identity, not by time.** Newest-by-
+  timestamp was not a fix — `timestamp` records when a line was *written*, and a resumed session
+  replays historical snapshots with fresh timestamps (observed 2026-07-10: five different window
+  instances written within 5ms). The logs interleave genuinely different limits, and mixing them
+  was the whole bug. `pickGoverningRateLimits()` now:
+  - filters to `limit_id == "codex"` (per-model quotas like `codex_bengalfox` /
+    *GPT-5.3-Codex-Spark* sit at ~0% used and would mask a drained general quota);
+  - filters to the plan the CLI is **authenticated** as, read from the `id_token` claims
+    (`codexPlanFromIdToken`). A stale `prolite` window at 100% used shares the directory with
+    the live `pro` window at 80%; only the authenticated plan governs our calls. Selecting the
+    minimum across plans reported **0% left while calls were being served**;
+  - buckets the survivors into window instances by `resets_at` (±120s jitter) and takes the
+    **consensus** instance — every active session re-reports the live window each turn, so it
+    dominates by count, whereas a lone spurious instance reports a further-forward reset at 0%
+    used. Selecting the *furthest* reset lands on that outlier and reports a drained quota as
+    empty;
+  - within that instance takes the **highest `used_percent`** — inside a fixed window usage only
+    climbs, so the maximum is both the latest reading and the conservative one.
+
+  Where the data cannot decide, it now resolves **pessimistically** (three defects caught by
+  running this wrapper against its own diff, all failing in the optimistic direction):
+  - a **tie on votes** is not a consensus, so it no longer breaks toward the later reset — that
+    is precisely the lone-outlier shape it was meant to reject;
+  - **bucketing is anchored**, not single-link: chained resets `20000,20120,20240,20360` used to
+    fuse into one four-vote bucket spanning 360s and out-vote the real window;
+  - **untagged legacy events cannot out-vote attributable ones.** If any event carries
+    `limit_id`/`plan_type`, events lacking them are excluded rather than tolerated.
+
+  Verified against behaviour: at `19% left` a Sol call is served; at `0% left` Sol is refused with
+  *"You've hit your usage limit."* The figure tracks the general `codex` limit for the
+  authenticated plan — the one that gates `gpt-5.6-sol`, the wrapper's model. **A cheap
+  `gpt-5.6-luna` probe is NOT a proof of Sol capacity:** Luna was served while the general limit
+  read 100% used. Probe with the model you intend to run. Still advisory.
+- **`recentCodexSessionLines` no longer discards all Codex budget data** when a session file
+  rotates mid-walk (`statSync` threw, the wrapping `catch` returned `[]`). It also pre-filters
+  to rate-limit lines instead of reading whole transcripts into memory on a hot hook.
+- **Luna guard is case-insensitive.** `gpt-5.6-LUNA:ultra` used to sail past it.
+- `--doctor` reports whether `ultra` is actually available; `verify`'s default effort is listed.
+- `test/run.sh` now runs the `ai-budget` node tests. It never did, so a green wrapper suite
+  said nothing about the budget library.
+
 ## v0.7.0 — 2026-07-10
+
+> **Superseded in part by v0.7.1.** The "both are CLI-side / the server enum stops at `xhigh`"
+> claim below is **wrong** for `max`, and the `ultra` default described below sent exactly the
+> same request as `max` because `multi_agent_v2` ships off. Retained as the record of what this
+> release did; read it with v0.7.1's corrections.
 
 **GPT-5.6 (Sol / Terra / Luna).** OpenAI broadly released GPT-5.6 on 2026-07-09; Codex CLI
 `0.143.0` added the models plus two reasoning tiers above `xhigh`. Tested against `0.144.1`.

@@ -25,7 +25,7 @@ check.)
    # prose / argument / claim:
    cat draft.md | ~/.claude/bin/codex-adversary.sh --mode prose \
        --focus "<optional steer, e.g. 'scrutinise the AUC claim and its denominator'>"
-   # (defaults to gpt-5.6-sol at --effort ultra; add --effort max to drop the fan-out)
+   # (defaults to gpt-5.6-sol at --effort max; add --effort ultra to opt into fan-out)
 
    # code / changes (Codex reads the repo + diff itself, read-only):
    ~/.claude/bin/codex-adversary.sh --mode diff --repo "$(pwd)"
@@ -50,29 +50,43 @@ Codex runs **`gpt-5.6-sol`** — the frontier agentic-coding model — and the w
 passes it explicitly (`-m`). Never rely on `~/.codex/config.toml`: other Codex clients (the
 ChatGPT.app Codex) rewrite it, so an inherited model makes a review non-reproducible.
 
-Two effort tiers now sit **above** `xhigh`. Both are **CLI-side** — the server's
-`reasoning.effort` enum stops at `xhigh`; the Codex CLI translates `max` and `ultra`.
+Two effort names sit **above** `xhigh`, and they are not the same kind of thing:
+
+- **`max` is a real server effort.** It goes on the wire verbatim (`ReasoningEffort::as_str()`
+  is documented "the exact value used on the wire"). It is the deepest reasoning Codex offers.
+- **`ultra` is CLI-side only.** `client.rs` maps `Ultra => Max` before the request, so the
+  wire sees `max` either way. The *only* thing `ultra` adds is `MultiAgentMode::Proactive`,
+  which permits the model to delegate to concurrent subagents — and that mode is granted
+  **only when the `multi_agent_v2` feature is enabled**, which ships off.
+
+With that feature off, `ultra` and `max` build **byte-identical requests**. So the wrapper
+enables `multi_agent_v2` for the invocation whenever you ask for `ultra`, and **refuses with
+exit 6 if it cannot** — `ultra` never silently means `max`.
 
 | Effort | What it is | Use when |
 |---|---|---|
-| **`ultra`** | Maximum reasoning **+ automatic delegation to concurrent subagents** | **The default** for `prose` / `diff` / `advise`. A hard, divisible target: a real diff, a manuscript, a consequential fork. |
-| **`max`** | Maximum reasoning depth, **single agent, no fan-out** | A hard problem that does *not* decompose — one gnarly proof, one subtle race. Also when you want depth without the fan-out cost. |
-| **`xhigh`** | Extra-high depth | **The default for `judge`.** Batch judging must emit one strict JSON array; `ultra`'s multi-agent synthesis adds output variance exactly where malformed JSON is fatal, and its fan-out multiplies per item. |
-| **`high`** / **`medium`** | Everyday depth | Deliberate downgrades under budget pressure, or a large batch where `xhigh` is overkill. |
-| **`low`** | Fast, light reasoning | **The default for `scout`.** Recon exists to spend little and hand a downstream agent a target map; a fan-out tier defeats its purpose. (Sol's own `default_reasoning_level` is `low`.) |
+| **`max`** | The deepest **server** reasoning; single agent, no fan-out | **The default** for `prose` / `diff` / `advise`. This is what every pass was already getting. |
+| **`ultra`** | `max` on the wire, **plus permission to fan out to subagents** | An explicit opt-in for a hard, *divisible* target where you want breadth: a large diff across many files, a long manuscript. Costs more; see below. |
+| **`xhigh`** | Extra-high depth | **The default for `judge`.** Batch judging must emit one strict JSON array; extra depth adds output variance exactly where malformed JSON is fatal. |
+| **`high`** | Solid depth | **The default for `verify`.** Source-fidelity checking is retrieval, not reasoning — a deeper tier does not make `grep` more accurate. |
+| **`medium`** | Everyday depth | Deliberate downgrade under budget pressure, or a large batch where `xhigh` is overkill. |
+| **`low`** | Fast, light reasoning | **The default for `scout`.** Recon exists to spend little and hand a downstream agent a target map. (Sol's own `default_reasoning_level` is `low`.) |
 
-**Standing preference: Sol at `ultra`, unless there is a *specific* reason to downgrade.**
-The specific reasons, all already wired as per-mode defaults: `scout` is cheap targeting;
-`judge` needs strict JSON at volume; a very large batch, or a drained 5h window, justifies
-dropping a tier. "It feels expensive" is not a specific reason.
+**`ultra` is an opt-in, not a standing preference.** Reach for it when the target genuinely
+decomposes and breadth is what you lack. Three cautions, all real:
+
+- **`Proactive` means the model is *permitted* to delegate, not that subagents ran.** Never
+  report an `ultra` pass as "N agents reviewed it" unless you saw them.
+- **Fan-out multiplies tokens** and engages an orchestration layer Codex still marks *under
+  development*. More findings is not the same as more true findings.
+- **The subagents are the same model**, so their errors correlate. A fan-out that "agrees
+  with itself" is weak evidence, not consensus. (Read-only *is* inherited by subagents —
+  verified with a write canary — so `ultra` remains safe against your working tree.)
 
 **Luna (`gpt-5.6-luna`) does not support `ultra`.** The CLI accepts `--effort ultra` on Luna
 *without erroring*, so a silent downgrade is indistinguishable from a real ultra run — the
 wrapper therefore **refuses** the combination rather than let you believe you got delegation
 you never got. Use `--effort max` on Luna, or switch to Sol.
-
-`ultra` is slower and fans out concurrent subagents. That's the right trade for a final
-referee pass on something you will ship; not for a quick gut-check.
 
 ## Synthesis contract (the actual value)
 
@@ -93,7 +107,7 @@ findings are inputs you weigh — never capitulate to them, never rubber-stamp t
   not persuasion).** Give the other model the specific counter-evidence — paste the repo
   lines that back a claim it called "unverifiable", or your reasoning for dismissing a
   finding — and ask it to **withdraw** (if the evidence genuinely refutes it) or **hold
-  and sharpen its reason**. Run at `--effort ultra` (or `max` if the point is single-threaded). Evidence flows both ways, but the
+  and sharpen its reason**. Run at `--effort max`. Evidence flows both ways, but the
   decision is yours. Cap at one round (two for high-stakes). Outcomes:
   - **Withdraws** → resolved; drop it, noting it was triangulated.
   - **Holds and sharpens** → often the real finding (e.g. "the backing exists in the repo,

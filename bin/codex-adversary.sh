@@ -44,18 +44,26 @@
 #       --repo . --focus "Is each cloze too easy for a Year-3 student?" > verdicts.json
 #
 # OPTIONS
-#   --mode   prose|diff|advise|scout|judge  prose/diff = adversarial review; advise =
-#                            counsel on a decision before acting; scout = read-only recon
-#                            returning a compressed target map; judge = structured batch
-#                            judging that returns validated JSON. Default: prose.
+#   --mode   prose|diff|advise|scout|judge|verify  prose/diff = adversarial review;
+#                            advise = counsel on a decision before acting; scout =
+#                            read-only recon returning a compressed target map; judge =
+#                            structured batch judging that returns validated JSON;
+#                            verify = SOURCE-FIDELITY ONLY — check every quotation,
+#                            attribution, DOI and number against the primary sources on
+#                            disk, and nothing else. Default: prose.
 #   --effort low|medium|high|xhigh|max|ultra
-#                            Codex reasoning effort. `max` and `ultra` are CLI-side
-#                            tiers above xhigh (the server's reasoning.effort enum stops
-#                            at xhigh); `ultra` also delegates to concurrent subagents.
-#                            Default is PER-MODE: prose/diff/advise=ultra, judge=xhigh,
-#                            scout=low. (Claude picks this per-pass; see the skill rubric.)
-#                            Luna does not support ultra and is REFUSED rather than
-#                            silently downgraded.
+#                            Codex reasoning effort. `max` is a real SERVER effort (it
+#                            goes on the wire verbatim). `ultra` is the only CLI-side
+#                            tier: the CLI maps it to `max` on the wire and, IF the
+#                            `multi_agent_v2` feature is on, additionally sets
+#                            MultiAgentMode::Proactive so the model may delegate to
+#                            concurrent subagents. This wrapper turns that feature on
+#                            for the invocation, and REFUSES if it cannot — `ultra`
+#                            never silently means `max`.
+#                            Default is PER-MODE: prose/diff/advise=max, judge=xhigh,
+#                            verify=high, scout=low. (Claude picks this per-pass; see
+#                            the skill rubric.) Luna has no `ultra` and is REFUSED
+#                            rather than silently downgraded.
 #   --focus  "..."           Optional extra instruction / the specific question / the
 #                            (judge) rubric for the pass.
 #   --file   PATH            (prose/advise/scout/judge) Read content/worklist from PATH
@@ -78,7 +86,8 @@
 #   3  Codex CLI not found.
 #   4  Codex failed / produced no output (auth, crash, empty) — see stderr.
 #   5  Codex timed out before producing output — see stderr.
-#   6  Codex CLI incompatible (no 'codex exec' or no --output-last-message) — see stderr.
+#   6  Codex CLI incompatible (no 'codex exec', no --output-last-message, or --effort
+#      ultra requested on a build that will not enable multi_agent_v2) — see stderr.
 #
 set -uo pipefail
 
@@ -96,25 +105,50 @@ TIMEOUT="600"
 DOCTOR=0
 
 # GPT-5.6 era. Sol is the frontier agentic-coding model; Terra is the balanced
-# everyday model; Luna is the fast/cheap one. `max` and `ultra` are CLI-side efforts
-# above `xhigh` (the SERVER's reasoning.effort enum stops at xhigh — the Codex CLI
-# translates them), and `ultra` additionally delegates to concurrent subagents.
+# everyday model; Luna is the fast/cheap one.
+#
+# EFFORT, precisely (codex-rs @ 0.144.1 — verified in source and by live probe):
+#   * `max` is a SERVER effort. `ReasoningEffort::as_str()` is documented "the exact
+#     value used on the wire" and emits "max"; nothing maps Max down to xhigh. A live
+#     `-c model_reasoning_effort=max` call is served. (An UNKNOWN value is forwarded
+#     verbatim and 400s — which is why VALID_EFFORTS stays an explicit allowlist.)
+#   * `ultra` is the ONLY CLI-side tier. `client.rs::reasoning_effort_for_request()`
+#     maps `Ultra => Max` before the request, so the wire sees "max" either way. The
+#     sole thing `ultra` adds is `MultiAgentMode::Proactive` — and
+#     `multi_agents.rs::effective_multi_agent_mode()` returns None unless
+#     `multi_agent_version == V2`, which `config/mod.rs` grants only when the
+#     `multi_agent_v2` feature is enabled. That feature ships OFF ("under development").
+#
+# Consequence: with `multi_agent_v2` off, `--effort ultra` and `--effort max` build
+# BYTE-IDENTICAL requests. `ultra` would be a lie. So this wrapper enables the feature
+# for the invocation (see ultra_v2_available) and REFUSES if it cannot — the same
+# fail-closed principle as the Luna guard, applied to the gate the Luna guard missed.
+# Proactive means the model is PERMITTED to delegate, not that subagents definitely ran.
 DEFAULT_MODEL="gpt-5.6-sol"
 VALID_EFFORTS="low medium high xhigh max ultra"
 
-# Per-mode default effort. Standing preference is Sol at `ultra`; the two downgrades
-# below are deliberate and specific, not timidity:
-#   scout — the mode exists to spend little and hand a downstream agent a target map.
-#           Running a fan-out reasoning tier to do recon defeats its entire purpose.
-#           (Sol's own default_reasoning_level is `low`.)
-#   judge — must emit ONE strict JSON array over N items. ultra's multi-agent synthesis
-#           adds output variance exactly where malformed JSON is fatal, and its fan-out
-#           multiplies per item across the batch.
+# Per-mode default effort. `max` is the default depth: it is the deepest SERVER effort,
+# and it is what every prose/diff/advise pass has actually been running at. Proactive
+# fan-out (`ultra`) is an explicit opt-in, not a silent default — it multiplies tokens,
+# it engages an under-development orchestration layer, and same-model subagents produce
+# correlated errors, so a fan-out's extra findings are not automatically better ones.
+#   scout  — the mode exists to spend little and hand a downstream agent a target map.
+#            Running a deep reasoning tier to do recon defeats its entire purpose.
+#            (Sol's own default_reasoning_level is `low`.)
+#   judge  — must emit ONE strict JSON array over N items. Depth beyond xhigh adds
+#            output variance exactly where malformed JSON is fatal, and a fan-out would
+#            multiply per item across the batch.
+#   verify — the work is RETRIEVAL, not reasoning: grep the source, compare the string.
+#            Reasoning tiers do not make `grep` more accurate, and a fan-out that splits
+#            the quote list across subagents loses the cross-checking that catches a
+#            quote lifted from the wrong paper. Depth here is a single careful reader
+#            with a shell. Cheap on purpose: this mode is meant to run on every pass.
 default_effort_for_mode() {
   case "$1" in
-    scout) echo "low" ;;
-    judge) echo "xhigh" ;;
-    *)     echo "ultra" ;;   # prose, diff, advise
+    scout)  echo "low" ;;
+    judge)  echo "xhigh" ;;
+    verify) echo "high" ;;
+    *)      echo "max" ;;   # prose, diff, advise
   esac
 }
 
@@ -141,11 +175,19 @@ doctor() {
   done
   [ "$miss" = "0" ] || { echo "  => INCOMPATIBLE: --output-last-message is required (see MAINTENANCE.md)"; return 6; }
   echo "  default model:  $DEFAULT_MODEL"
-  echo "  valid efforts:  $VALID_EFFORTS  (max/ultra are CLI-side; the server enum stops at xhigh)"
+  echo "  valid efforts:  $VALID_EFFORTS  (max is a server effort; only ultra is CLI-side)"
   local m
-  for m in prose diff advise scout judge; do
+  for m in prose diff advise scout judge verify; do
     printf '  default effort: %-7s %s\n' "$m" "$(default_effort_for_mode "$m")"
   done
+  # `ultra` is inert unless multi_agent_v2 can be turned on; report whether it can, so
+  # the operator learns it here rather than by being refused mid-review.
+  if codex features list -c features.multi_agent_v2=true 2>/dev/null \
+       | awk '$1 == "multi_agent_v2" { print $NF }' | grep -qx 'true'; then
+    echo "  ultra (multi_agent_v2): available — proactive delegation can be enabled per-invocation"
+  else
+    echo "  ultra (multi_agent_v2): UNAVAILABLE — --effort ultra will be refused (it would equal max)"
+  fi
   echo "  => compatible. (Auth not checked here — run a real review to confirm 'codex login'.)"
 }
 
@@ -171,7 +213,7 @@ done
 case "$TIMEOUT" in (*[!0-9]*|'') die_usage "--timeout must be a positive integer (seconds): $TIMEOUT" ;; esac
 [ "$TIMEOUT" -ge 1 ] || die_usage "--timeout must be at least 1 second: $TIMEOUT"
 
-case "$MODE" in prose|diff|advise|scout|judge) ;; *) die_usage "--mode must be prose, diff, advise, scout, or judge" ;; esac
+case "$MODE" in prose|diff|advise|scout|judge|verify) ;; *) die_usage "--mode must be prose, diff, advise, scout, judge, or verify" ;; esac
 
 [ "$EFFORT_SET" = "1" ] || EFFORT="$(default_effort_for_mode "$MODE")"
 case "$EFFORT" in low|medium|high|xhigh|max|ultra) ;; *) die_usage "--effort must be one of: $VALID_EFFORTS" ;; esac
@@ -184,7 +226,10 @@ case "$EFFORT" in low|medium|high|xhigh|max|ultra) ;; *) die_usage "--effort mus
 # Luna advertises low..max and no `ultra`, but the CLI accepts `--effort ultra` on Luna
 # WITHOUT error — so a silent downgrade is indistinguishable from a real ultra run.
 # Refuse rather than let a caller believe they got delegation they never got.
-case "$MODEL:$EFFORT" in
+# Lowercased for the test: `case` is case-sensitive, and a `gpt-5.6-LUNA` slug would
+# otherwise sail past the very guard that exists to prevent a silent downgrade.
+MODEL_LC="$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]')"
+case "$MODEL_LC:$EFFORT" in
   *luna*:ultra) die_usage "model '$MODEL' does not support --effort ultra (Luna supports up to 'max'); Codex accepts it silently, so this is refused rather than downgraded. Use --effort max, or --model $DEFAULT_MODEL." ;;
 esac
 
@@ -197,6 +242,28 @@ CODEX_HELP="$(codex exec --help 2>/dev/null || true)"
 [ -n "$CODEX_HELP" ] || { echo "codex-adversary.sh: 'codex exec' is unavailable in your Codex CLI ('codex exec --help' failed). This wrapper needs the 'codex exec' subcommand — update Codex, or see MAINTENANCE.md." >&2; exit 6; }
 codex_supports() { printf '%s' "$CODEX_HELP" | grep -q -- "$1"; }
 codex_supports "--output-last-message" || { echo "codex-adversary.sh: your Codex CLI lacks 'codex exec --output-last-message', which this wrapper needs for clean capture. Update Codex, or add a --json fallback (see MAINTENANCE.md)." >&2; exit 6; }
+
+# --- the ultra gate: make `ultra` mean what it claims, or refuse -----------------
+# Per the EFFORT note above, `ultra` differs from `max` ONLY when the `multi_agent_v2`
+# feature is on; otherwise both build byte-identical requests. Enable it for THIS
+# invocation only — never by mutating ~/.codex/config.toml, which the ChatGPT.app Codex
+# rewrites underneath us. Confirm the override actually takes in THIS build (cheap: no
+# model call, no tokens) and fail closed if it does not, so a caller can never believe
+# they got delegation they never got.
+ULTRA_V2_FLAG=0
+ultra_v2_available() {
+  codex features list -c features.multi_agent_v2=true 2>/dev/null \
+    | awk '$1 == "multi_agent_v2" { print $NF }' | grep -qx 'true'
+}
+if [ "$EFFORT" = "ultra" ]; then
+  if ultra_v2_available; then
+    ULTRA_V2_FLAG=1
+  else
+    echo "codex-adversary.sh: --effort ultra needs the Codex 'multi_agent_v2' feature, and this build will not enable it (probed with 'codex features list -c features.multi_agent_v2=true')." >&2
+    echo "codex-adversary.sh: without that feature 'ultra' sends exactly the same request as 'max' and delegates nothing — refusing rather than silently downgrading. Use --effort max." >&2
+    exit 6
+  fi
+fi
 
 # --- portable timeout -----------------------------------------------------------
 # Args: SECS INFILE -- cmd...   INFILE is fed as stdin via an EXPLICIT redirect
@@ -256,6 +323,27 @@ JUDGE_FRAMING='You are a careful, skeptical JUDGE adjudicating a BATCH of items 
 
 SCOUT_FRAMING='You are a fast reconnaissance scout for another AI agent that will do the actual work. You have READ-ONLY access to a codebase; USE it — grep, read files, trace structure — to LOCATE what the downstream agent needs, then hand back a compressed targeting map, NOT an analysis, fix, or solution. Your output is consumed by another agent and spends its budget, so be terse and decision-ready: no preamble, no restating the task, no essays, no pasting large code blocks. Report ONLY: (1) the specific files with line-ranges/symbols that are relevant, each with a one-line why; (2) where to START and in what order; (3) load-bearing facts the agent must know before touching it (invariants, gotchas, the real entry point vs decoys); (4) what looks relevant but is NOT, so the agent can skip it. If you cannot locate something, say so in one line rather than guessing. Aim for under ~400 words; a tight annotated list beats prose. Map the territory; do not conquer it.'
 
+VERIFY_FRAMING='You are a SOURCE-FIDELITY AUDITOR. You have READ-ONLY access to the primary sources on disk. Your ONLY job is to check whether the document says what its sources say. Do NOT evaluate the argument. Do NOT comment on style, structure, or significance. Do NOT suggest improvements to the reasoning. Source fidelity, and nothing else.
+
+METHOD. Extract from the document every (a) quoted string, (b) claim attributed to a named author or work, (c) named theorem or result and what it is used for, (d) specific number, date, unit, or denominator. For each, locate the source on disk and check it. Never rule from memory when a file can be read.
+
+TWO TRAPS THAT HAVE ALREADY CAUSED FALSE CLEARANCES HERE:
+  1. Extracted-text files may contain NUL bytes. Plain `grep` then treats them as binary and `grep -o` silently prints NOTHING — which reads exactly like "quote absent". ALWAYS use `grep -a`. Never report a quote as missing until you have tried `grep -a`, a case-insensitive search, and a search for a distinctive INTERIOR fragment of the quote.
+  2. PDF text layers render ligatures oddly: "fi", "ff", "ffi" may be single glyphs, so "specific" may not match. Search around them.
+
+CLASSES OF ERROR TO HUNT, in order of how often they occur:
+  * PARAPHRASE IN QUOTATION MARKS — the sense is right, the words are not. Quotation marks assert verbatim text.
+  * SLOGAN DRIFT — the document cites the version everyone repeats rather than the version the author wrote.
+  * ABSTRACT vs THEOREM — a paper abstract claims more than the paper proves. If a claim leans on an abstract, title, or summary, go and read what the body actually establishes, and report the gap.
+  * MISATTRIBUTION — a conclusion put in an author'\''s mouth that the author does not draw, or that their own position contradicts.
+  * THEOREM OVERREACH — a result used for more than its hypotheses license, or used with its direction/quantifiers reversed.
+  * SOURCE REBUTS THE USE — the cited work explicitly argues against the purpose it is cited for. Read enough of the source to notice.
+  * ARITHMETIC — recompute every number. Check units and denominators.
+
+YOU HAVE NO NETWORK. Do not attempt to resolve DOIs online. Check each bibliography entry against the local full text where one exists (title, authors, year, venue in the file header), and explicitly LIST any reference you could not check so a human can.
+
+OUTPUT. A ranked list, most severe first. For each finding: the document'\''s claim, the VERDICT (VERBATIM / PARAPHRASE-IN-QUOTES / NOT FOUND / MISATTRIBUTED / OVERREACH / SOURCE-REBUTS-USE / ARITHMETIC-ERROR), the evidence as file:line with the source'\''s actual words, and the minimal correction. Then a short list of claims you verified as sound, so the reader knows what was checked. Then the unverifiable list. If every quotation and attribution checks out, say exactly that in one sentence — do not pad with nitpicks, and do not drift into reviewing the argument.'
+
 build_codex_cmd() {
   # Essential (preflighted): read-only sandbox + clean capture via --output-last-message.
   CODEX_CMD=(codex exec --sandbox read-only)
@@ -269,6 +357,8 @@ build_codex_cmd() {
     if codex_supports "$f"; then CODEX_CMD+=("$f")
     else echo "codex-adversary.sh: note — this Codex build lacks $f; proceeding without it." >&2; fi
   done
+  # `ultra` is inert without this; the gate above already refused if it cannot be set.
+  [ "$ULTRA_V2_FLAG" = "1" ] && CODEX_CMD+=(-c features.multi_agent_v2=true)
   CODEX_CMD+=(-c model_reasoning_effort="$EFFORT" --output-last-message "$OUT_FILE")
   CODEX_CMD+=(-m "$MODEL")   # always explicit — never inherit a config another client mutates
 }
@@ -331,6 +421,33 @@ elif [ "$MODE" = "scout" ]; then
     [ -n "$FOCUS" ] && printf '\nNarrow the scout to: %s\n' "$FOCUS"
     printf '\nCodebase to scout (read-only): %s\n' "$REPO"
     printf '\n--- WHAT TO SCOUT FOR ---\n\n'
+    cat "$CONTENT_FILE"
+    printf '\n'
+  } > "$PROMPT_FILE"
+  build_codex_cmd
+  CODEX_CMD+=(-C "$REPO")
+
+elif [ "$MODE" = "verify" ]; then
+  # Source-fidelity audit. Orthogonal to `prose`: prose asks whether the argument is
+  # WRONG; verify asks whether the document says what its sources say. Cheap, mechanical,
+  # and the highest-yield pass available — most citation failures are string mismatches,
+  # not reasoning errors, and no amount of reasoning effort finds them without the source.
+  # Unlike prose (rooted in an empty temp dir), verify NEEDS the sources on disk.
+  CONTENT_FILE="$TMPDIR_RUN/content.txt"
+  if [ -n "$FILE" ]; then
+    [ -f "$FILE" ] || die_usage "--file not found: $FILE"
+    cat "$FILE" > "$CONTENT_FILE" || die_usage "could not read --file: $FILE"
+  else
+    cat > "$CONTENT_FILE"   # the document whose citations are being audited, on stdin
+  fi
+  LC_ALL=C grep -q '[^[:space:]]' "$CONTENT_FILE" || { echo "codex-adversary.sh: no document provided on stdin/--file" >&2; exit 2; }
+  [ -d "$REPO" ] || die_usage "--repo is not a directory: $REPO"
+  {
+    printf '%s\n' "$VERIFY_FRAMING"
+    [ -n "$FOCUS" ] && printf '\nAdditional context for this audit (source locations, known traps, what to prioritise): %s\n' "$FOCUS"
+    printf '\nPrimary sources, read-only, rooted here: %s\n' "$REPO"
+    printf '(Absolute paths outside this root are also readable. Use the shell.)\n'
+    printf '\n--- DOCUMENT TO AUDIT ---\n\n'
     cat "$CONTENT_FILE"
     printf '\n'
   } > "$PROMPT_FILE"

@@ -676,12 +676,15 @@ test('pickClaudeWindows: freshWin null + prevState null → null', () => {
   assert.equal(pickClaudeWindows(null, null, nowMs), null);
 });
 
-// --- freshest-event selection across interleaved sessions -----------------------
-// Regression: the reader used to pick the newest session FILE and take that file's
+// --- governing-window selection across interleaved sessions ---------------------
+// Regression 1: the reader used to pick the newest session FILE and take that file's
 // LAST rate_limits line. With the ChatGPT.app Codex and the CLI writing concurrently,
-// the newest file need not carry the newest EVENT — and the two report DIFFERENT
-// window instances (distinct resets_at). On 2026-07-10 this reported "17% left" while
-// the window actually governing CLI calls was 100% used. Select by event timestamp.
+// the newest file need not carry the newest EVENT.
+// Regression 2: selecting the newest EVENT is not a fix either. Concurrent writers
+// report DIFFERENT window instances (distinct resets_at) with wildly different
+// used_percent — 16% and 96% within the same second, observed 2026-07-10. Nothing in
+// the payload marks which one governs the next call, so we do not guess: take the most
+// conservative recent reading. Under-reporting exhaustion is the costly direction.
 
 const rlLine = (ts, primaryUsed, secondaryUsed, resetsAt = 1782314385) => JSON.stringify({
   timestamp: ts,
@@ -692,44 +695,244 @@ const rlLine = (ts, primaryUsed, secondaryUsed, resetsAt = 1782314385) => JSON.s
   }},
 });
 
-test('pickFreshestRateLimits: newest EVENT wins even when it is not the last line', async () => {
-  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+test('pickGoverningRateLimits: the worst recent reading wins, not the last line', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
-  // Lines concatenated from two sessions; the LAST line is the OLDER event.
   const lines = [
-    rlLine('2026-07-10T00:16:19.728Z', 96, 15),  // newest event: 4% left
-    rlLine('2026-07-10T00:16:09.407Z', 16, 3),   // older event, appears last
+    rlLine('2026-07-10T00:16:19.728Z', 96, 15),  // 4% left
+    rlLine('2026-07-10T00:16:09.407Z', 16, 3),   // healthier, appears last
   ];
-  const r = pickFreshestRateLimits(lines, now);
-  assert.equal(r.fiveHourPct, 4, 'must take the newest event, not the last line');
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 4, 'must not take the last line');
   assert.equal(r.weeklyPct, 85);
 });
 
-test('pickFreshestRateLimits: exhausted window reports 0, not a stale healthy number', async () => {
-  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+test('pickGoverningRateLimits: exhausted window reports 0, not a stale healthy number', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
   const lines = [
-    rlLine('2026-07-10T00:10:00.000Z', 17, 3),    // stale "83% left"
+    rlLine('2026-07-10T00:10:00.000Z', 17, 3),    // "83% left"
     rlLine('2026-07-10T00:17:00.000Z', 100, 16),  // truth: exhausted
   ];
-  const r = pickFreshestRateLimits(lines, now);
+  const r = pickGoverningRateLimits(lines, now);
   assert.equal(r.fiveHourPct, 0);
   assert.equal(r.weeklyPct, 84);
 });
 
-test('pickFreshestRateLimits: ignores lines with no timestamp, still finds the freshest', async () => {
-  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+// THE case freshest-by-timestamp gets wrong. Both events are real, milliseconds apart,
+// from concurrent writers reporting the SAME window instance. Newest-wins is a coin-flip.
+// Within a fixed window used_percent only climbs, so the maximum is the current reading.
+test('pickGoverningRateLimits: same window, disagreeing writers -> the highest used_percent', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
-  const untimed = JSON.stringify({ rate_limits: {
-    primary:   { used_percent: 1, window_minutes: 300,   resets_at: 1782314385 },
-    secondary: { used_percent: 1, window_minutes: 10080, resets_at: 1782358258 },
-  }});
-  const r = pickFreshestRateLimits([untimed, rlLine('2026-07-10T00:17:00.000Z', 90, 20)], now);
-  assert.equal(r.fiveHourPct, 10, 'a timestamped event outranks an untimed one');
+  const lines = [
+    rlLine('2026-07-10T00:16:19.728Z', 96, 20),  // drained
+    rlLine('2026-07-10T00:16:19.900Z', 16, 5),   // NEWER by 172ms, looks healthy
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 4, 'newest-event would have said 84% left');
+  assert.equal(r.weeklyPct, 80, 'newest-event would have said 95% left');
 });
 
-test('pickFreshestRateLimits: falls back to last-wins when NO line carries a timestamp', async () => {
-  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
+// `timestamp` is when the line was WRITTEN. A resumed session replays OLD window instances
+// with fresh timestamps, so staleness must be judged by resets_at, never by timestamp.
+test('pickGoverningRateLimits: an EXPIRED window is ignored, however recently written', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const EXPIRED = now - 1;
+  const LIVE = now + 14385;
+  const lines = [
+    // replayed one millisecond ago, but it describes a window that has already reset
+    rlLine('2026-07-10T00:17:00.001Z', 100, 99, EXPIRED),
+    rlLine('2026-07-10T00:17:00.000Z', 10, 5, LIVE),
+    rlLine('2026-07-10T00:17:00.002Z', 10, 5, LIVE),
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 90, 'the replayed expired window must not dominate');
+  assert.equal(r.fiveHourResetsAt, LIVE);
+});
+
+// No consensus (every bucket a single vote) must NOT resolve to the furthest reset — that is
+// precisely the lone-outlier shape. With nothing to break the tie, be pessimistic.
+test('pickGoverningRateLimits: no consensus -> pessimistic, never the furthest reset', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const lines = [
+    rlLine('2026-07-10T00:17:00.000Z', 95, 10, now + 1000),  // governing: 5% left
+    rlLine('2026-07-10T00:17:00.001Z',  0,  0, now + 2000),  // lone outlier, further reset
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 5, 'furthest-reset tie-break would have reported 100% left');
+});
+
+// Greedy single-link chaining would fuse 20000..20360 into one four-vote bucket spanning
+// 360s, out-voting three genuine snapshots of the real window.
+test('pickGoverningRateLimits: chained resets do not manufacture a false plurality', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const lines = [
+    ...[0, 120, 240, 360].map((d, i) => rlLine(`2026-07-10T00:17:0${i}.000Z`, 0, 0, now + 20000 + d)),
+    ...[0, 1, 2].map((d) => rlLine('2026-07-10T00:17:00.000Z', 95, 10, now + 10000 + d)),
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 5, 'a chained bucket must not span more than jitterSec');
+});
+
+// Untagged events cannot be attributed to a plan. If ANY event is tagged, the untagged ones
+// are legacy (likely a pre-upgrade plan) and must not vote.
+test('pickGoverningRateLimits: untagged events cannot outvote plan-tagged ones', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const R = now + 14385;
+  const tagged = JSON.stringify({ payload: { rate_limits: {
+    limit_id: 'codex', plan_type: 'pro',
+    primary:   { used_percent: 95, window_minutes: 300,   resets_at: R },
+    secondary: { used_percent: 10, window_minutes: 10080, resets_at: R + 100 },
+  }}});
+  // The untagged pair describe a DIFFERENT window instance, so they form a plurality.
+  const OTHER = R + 5000;
+  const lines = [tagged, rlLine('2026-07-10T00:17:00.000Z', 0, 0, OTHER), rlLine('2026-07-10T00:17:01.000Z', 0, 0, OTHER)];
+  const r = pickGoverningRateLimits(lines, now, { plan: 'pro' });
+  assert.equal(r.fiveHourPct, 5, 'two untagged 0% events must not outvote one tagged 95% event');
+  assert.equal(r.fiveHourResetsAt, R);
+});
+
+// Snapshots of one window written a second apart carry resets_at a second apart. They are
+// the same instance and must be bucketed together, or the newer reading is discarded.
+test('pickGoverningRateLimits: resets_at jitter within a window is bucketed together', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const R = now + 14385;
+  const lines = [
+    rlLine('2026-07-10T00:17:00.000Z', 75, 12, R),      // later reading, reset 1s earlier
+    rlLine('2026-07-10T00:16:00.000Z', 73, 12, R + 1),  // strictly-max resets_at, older reading
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 25, 'a 1s reset jitter must not split one window in two');
+});
+
+// The bug that made "0% left" appear while calls were being served: a stale `prolite`
+// window sits in the same logs as the live `pro` one. Only the authenticated plan governs.
+test('pickGoverningRateLimits: filters to the authenticated plan', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const R = now + 14385;
+  const tagged = (plan, used, wk) => JSON.stringify({
+    timestamp: '2026-07-10T00:17:00.000Z',
+    payload: { rate_limits: {
+      limit_id: 'codex', plan_type: plan,
+      primary:   { used_percent: used, window_minutes: 300,   resets_at: R },
+      secondary: { used_percent: wk,   window_minutes: 10080, resets_at: R + 100 },
+    }},
+  });
+  const lines = [tagged('prolite', 100, 30), tagged('pro', 75, 12)];
+  const r = pickGoverningRateLimits(lines, now, { plan: 'pro' });
+  assert.equal(r.fiveHourPct, 25, "the other plan's exhausted window must be ignored");
+  assert.equal(r.weeklyPct, 88);
+
+  // With no plan known we must not silently adopt one; conservatism across plans is the
+  // documented fallback, and the caller is told nothing more than the logs support.
+  const unknown = pickGoverningRateLimits(lines, now);
+  assert.equal(unknown.fiveHourPct, 0, 'unknown plan -> worst across plans, not a guess');
+});
+
+// Observed 2026-07-10: every active session re-reports the live window each turn, so it
+// dominates by count, while a lone spurious instance reports a further reset at 0% used.
+// Selecting the furthest reset lands on that outlier and calls a drained quota empty.
+test('pickGoverningRateLimits: the consensus window wins over a further-reset outlier', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const LIVE = now + 14000;
+  const OUTLIER = LIVE + 774;   // further forward, but reported once, at 0% used
+  const lines = [
+    ...Array.from({ length: 12 }, () => rlLine('2026-07-10T01:18:00.000Z', 80, 13, LIVE)),
+    rlLine('2026-07-10T01:18:30.000Z', 0, 0, OUTLIER),
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 20, 'furthest-reset selection would have reported 100% left');
+  assert.equal(r.fiveHourResetsAt, LIVE);
+});
+
+// Per-model quotas (codex_bengalfox = GPT-5.3-Codex-Spark) are always ~0% used and would
+// mask a drained general quota if mixed in.
+test('pickGoverningRateLimits: ignores per-model limit_ids', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const R = now + 14385;
+  const tagged = (limitId, used) => JSON.stringify({
+    timestamp: '2026-07-10T00:17:00.000Z',
+    payload: { rate_limits: {
+      limit_id: limitId, plan_type: 'pro',
+      primary:   { used_percent: used, window_minutes: 300,   resets_at: R },
+      secondary: { used_percent: 10,   window_minutes: 10080, resets_at: R + 100 },
+    }},
+  });
+  const r = pickGoverningRateLimits([tagged('codex_bengalfox', 0), tagged('codex', 80)], now, { plan: 'pro' });
+  assert.equal(r.fiveHourPct, 20, "a fresh per-model quota must not mask the general one");
+});
+
+test('codexPlanFromIdToken: reads chatgpt_plan_type out of the namespaced claim', async () => {
+  const { codexPlanFromIdToken } = await import('../bin/ai-budget-lib.mjs');
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const tok = `hdr.${b64({ 'https://api.openai.com/auth': { chatgpt_plan_type: 'pro' } })}.sig`;
+  assert.equal(codexPlanFromIdToken(tok), 'pro');
+  assert.equal(codexPlanFromIdToken('garbage'), null);
+  assert.equal(codexPlanFromIdToken(undefined), null);
+  assert.equal(codexPlanFromIdToken(`hdr.${b64({ sub: 'x' })}.sig`), null, 'no claim -> null, never a guess');
+});
+
+// The 5h and weekly minima answer different questions and may come from different events.
+test('pickGoverningRateLimits: windows are minimised independently', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const lines = [
+    rlLine('2026-07-10T00:16:00.000Z', 90, 5),   // worst primary
+    rlLine('2026-07-10T00:16:30.000Z', 10, 40),  // worst secondary
+  ];
+  const r = pickGoverningRateLimits(lines, now);
+  assert.equal(r.fiveHourPct, 10);
+  assert.equal(r.weeklyPct, 60);
+});
+
+// Timestamps are deliberately not consulted at all: they record when a line was written,
+// not when the reading was taken. An untimed line describing the live window counts exactly
+// as much as a timestamped one describing it.
+test('pickGoverningRateLimits: timestamps are irrelevant; the window instance decides', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const untimed = JSON.stringify({ rate_limits: {
+    primary:   { used_percent: 99, window_minutes: 300,   resets_at: 1782314385 },
+    secondary: { used_percent: 99, window_minutes: 10080, resets_at: 1782358258 },
+  }});
+  const r = pickGoverningRateLimits([untimed, rlLine('2026-07-10T00:17:00.000Z', 90, 20)], now);
+  assert.equal(r.fiveHourPct, 1, 'same live window: the highest used_percent wins');
+});
+
+test('pickGoverningRateLimits: falls back to an untimed line when nothing is timestamped', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  const now = 1782300000;
+  const untimed = JSON.stringify({ rate_limits: {
+    primary:   { used_percent: 40, window_minutes: 300,   resets_at: 1782314385 },
+    secondary: { used_percent: 10, window_minutes: 10080, resets_at: 1782358258 },
+  }});
+  const r = pickGoverningRateLimits([untimed], now);
+  assert.equal(r.fiveHourPct, 60);
+  assert.equal(r.weeklyPct, 90);
+});
+
+// The pre-filter guards a hot hook against reading whole session transcripts into
+// memory. It must not drop the bare-dict shape that findRateLimits also accepts.
+test('looksLikeRateLimitLine: matches both wrapper and bare-dict shapes, rejects noise', async () => {
+  const { looksLikeRateLimitLine } = await import('../bin/ai-budget-lib.mjs');
+  assert.equal(looksLikeRateLimitLine(rlLine('2026-07-10T00:00:00.000Z', 1, 1)), true);
+  assert.equal(looksLikeRateLimitLine(JSON.stringify({
+    primary: { used_percent: 1 }, secondary: { used_percent: 1 },
+  })), true, 'bare dict must survive the pre-filter');
+  assert.equal(looksLikeRateLimitLine(JSON.stringify({ type: 'agent_message', text: 'hi' })), false);
+});
+
+test('pickGoverningRateLimits: falls back to untimed lines when NO line carries a timestamp', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
   const now = 1782300000;
   const a = JSON.stringify({ rate_limits: {
     primary:   { used_percent: 10, window_minutes: 300,   resets_at: 1782314385 },
@@ -739,11 +942,11 @@ test('pickFreshestRateLimits: falls back to last-wins when NO line carries a tim
     primary:   { used_percent: 40, window_minutes: 300,   resets_at: 1782314385 },
     secondary: { used_percent: 40, window_minutes: 10080, resets_at: 1782358258 },
   }});
-  const r = pickFreshestRateLimits([a, b], now);
-  assert.equal(r.fiveHourPct, 60, 'last-wins fallback preserves old behaviour');
+  const r = pickGoverningRateLimits([a, b], now);
+  assert.equal(r.fiveHourPct, 60, 'untimed lines get the same pessimistic treatment');
 });
 
-test('pickFreshestRateLimits: returns null when there are no rate_limit events', async () => {
-  const { pickFreshestRateLimits } = await import('../bin/ai-budget-lib.mjs');
-  assert.equal(pickFreshestRateLimits(['{}', 'not json'], 1782300000), null);
+test('pickGoverningRateLimits: returns null when there are no rate_limit events', async () => {
+  const { pickGoverningRateLimits } = await import('../bin/ai-budget-lib.mjs');
+  assert.equal(pickGoverningRateLimits(['{}', 'not json'], 1782300000), null);
 });

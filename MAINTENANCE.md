@@ -35,11 +35,26 @@ Tested against **Codex CLI 0.144.1**. Run `codex-adversary.sh --doctor` to check
    the value verbatim. Update the `--effort` validation `case` (`VALID_EFFORTS`), the skill's
    rubric, and consider a `codex_supports`-style guard. A rejected effort surfaces as exit 4.
    **This happened on 2026-07-09 (GPT-5.6):** `max` and `ultra` were added *above* `xhigh`.
-   They are **CLI-side** — the server's `reasoning.effort` enum is still
-   `none|minimal|low|medium|high|xhigh`, and an unknown value is passed straight through to a
-   400. Keep `VALID_EFFORTS` an explicit allowlist; do not relax it to "anything goes".
+   They are **not the same kind of thing**, and the distinction is load-bearing:
+   - `max` is a **server** effort. `ReasoningEffort::as_str()` in `codex-rs/protocol` is
+     documented "the exact value used on the wire" and emits `"max"`; nothing maps it down.
+   - `ultra` is **CLI-side**. `core/src/client.rs::reasoning_effort_for_request()` maps
+     `Ultra => Max` before the request, so the wire sees `max`. Its sole extra effect is
+     `MultiAgentMode::Proactive` — and `session/multi_agents.rs::effective_multi_agent_mode()`
+     returns `None` unless `multi_agent_version == V2`, which `config/mod.rs` grants only when
+     the `multi_agent_v2` feature is on. That feature ships **off** ("under development").
+
+   So with the feature off, `ultra` and `max` build byte-identical requests: `ultra` would be
+   a lie. The wrapper therefore enables `features.multi_agent_v2` per-invocation for `ultra`
+   and **exits 6 if it cannot** (see `ultra_v2_available`). If a future Codex renames or
+   removes that feature, the gate fails closed and `ultra` is refused — which is correct.
+   Re-check `ultra_v2_available`'s parse of `codex features list` when the CLI changes.
+
+   An **unknown** effort value is forwarded verbatim and 400s, so keep `VALID_EFFORTS` an
+   explicit allowlist; do not relax it to "anything goes".
    Note also that **Luna accepts `--effort ultra` without error despite not supporting it** —
-   a silent downgrade. The wrapper refuses that pair; re-check the guard when variants change.
+   a silent downgrade. The wrapper refuses that pair (case-insensitively); re-check the guard
+   when variants change: only Sol and Terra list `ultra` in `supported_reasoning_levels`.
 5. **Auth/login flow changes.** The wrapper doesn't touch auth; a logged-out Codex surfaces as
    **exit 4**. README troubleshooting points users at `codex login`.
 6. **`codex exec --help` output format changes** so `grep` misses a flag that is actually
@@ -50,13 +65,40 @@ Tested against **Codex CLI 0.144.1**. Run `codex-adversary.sh --doctor` to check
    `set -m` engaged and falls back to single-PID kill; with GNU `timeout`/`gtimeout` it uses
    `-k`. If a platform breaks this, the timeout still fires — just less thorough on
    grandchildren.
+8. **`rate_limits` telemetry shape changes.** `ai-budget` reads `~/.codex/sessions/**/*.jsonl`.
+   Three properties of that data are load-bearing and non-obvious; each has already produced a
+   wrong budget reading:
+   - **`timestamp` is when the line was WRITTEN, not when the reading was taken.** Resumed and
+     forked sessions replay historical snapshots with fresh timestamps. Never order by it.
+   - **The logs interleave different limits.** `limit_id` separates the general quota
+     (`codex`) from per-model quotas (`codex_bengalfox`); `plan_type` separates plans, and a
+     stale plan's exhausted window coexists with the live one. Only the plan in the
+     `id_token` governs your calls — hence `codexPlanFromIdToken`. If OpenAI moves that claim,
+     the function returns `null`, the plan filter is skipped, and readings get pessimistic
+     rather than wrong. Re-point it, don't remove it.
+   - **Several window instances coexist per plan.** Pick the *consensus* `resets_at` bucket,
+     not the furthest — a lone outlier reporting a further reset at 0% used will otherwise
+     report a drained quota as empty. Ties and unattributable events resolve pessimistically.
+
+   The reported figure is the general `codex` limit, which gates `gpt-5.6-sol`. It does **not**
+   predict every model: Luna was served while that limit read 100% used. Treat the whole thing
+   as advisory; the only certain check is a cheap call **with the model you will actually run**:
+   `codex exec -m gpt-5.6-sol -c model_reasoning_effort=low ... "Reply: OK"`.
 
 ## When you bump the supported Codex version
 
-1. `./bin/codex-adversary.sh --doctor` — confirm all flags present.
-2. `./test/run.sh` (stubbed) plus one live `--mode prose`, `--mode diff`, and `--mode scout` smoke.
-3. Update "Tested against …" here and in `README.md`.
-4. Note it in `CHANGELOG.md`.
+1. `./bin/codex-adversary.sh --doctor` — confirm all flags present, and that it still reports
+   `ultra (multi_agent_v2): available`. If that flips to UNAVAILABLE, `ultra` is refused by
+   design; check whether the feature was renamed before relaxing the gate.
+2. `./test/run.sh` (stubbed; it now also runs the `ai-budget` node tests) plus one live
+   `--mode prose`, `--mode diff`, and `--mode scout` smoke.
+3. Re-verify the safety claim: subagents spawned under `--effort ultra` must still inherit the
+   read-only sandbox. Test with a write canary, not by asking the model.
+4. Cross-check `ai-budget read` against a live call **using `-m gpt-5.6-sol`** — if it says 0%
+   left and a *Sol* call is served, the window-selection rule has drifted (see 8). Do not probe
+   with Luna: it was observed served while the general `codex` limit read 100% used.
+5. Update "Tested against …" here and in `README.md`.
+6. Note it in `CHANGELOG.md`.
 
 ## Test surface
 

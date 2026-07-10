@@ -3,8 +3,9 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSy
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { pickFreshestRateLimits, sumClaudeTranscriptTokens, parseClaudeUsageWindows,
-         formatSnapshot, formatIfBelow, projectWeeklyTrend, pickClaudeWindows } from './ai-budget-lib.mjs';
+import { pickGoverningRateLimits, looksLikeRateLimitLine, codexPlanFromIdToken,
+         sumClaudeTranscriptTokens, parseClaudeUsageWindows, formatSnapshot, formatIfBelow,
+         projectWeeklyTrend, pickClaudeWindows } from './ai-budget-lib.mjs';
 
 const HOME = homedir();
 const STATE = join(HOME, '.claude', '.cache', 'ai-budget.json');
@@ -27,24 +28,53 @@ function writeHistory(history) {
   } catch { /* never crash refresh */ }
 }
 
-// Lines from EVERY session touched recently — not just the newest file. Concurrent
-// Codex sessions (ChatGPT.app + CLI) report different window instances, so the
-// freshest rate-limit event can live in a file that is not the newest by mtime.
-// pickFreshestRateLimits() orders across them by each line's own timestamp.
+// Rate-limit lines from EVERY session touched recently — not just the newest file.
+// Concurrent Codex sessions (ChatGPT.app + CLI) report different window instances, so
+// the governing snapshot can live in a file that is not the newest by mtime.
+// pickGoverningRateLimits() then takes the most conservative recent reading.
+//
+// Two hazards, both a direct consequence of walking a directory that concurrent Codex
+// processes are actively writing and rotating:
+//   * A file can vanish between readdirSync naming it and statSync reading it. A throw
+//     there must skip that entry, NOT abort the walk — an aborted walk returns [], which
+//     silently drops Codex from the budget snapshot entirely.
+//   * Session transcripts carry tool output and get large. Only rate-limit lines are
+//     ever used, so filter before accumulating rather than holding every line in memory
+//     on a hook that runs at SessionStart and before tool calls.
+// The plan the Codex CLI is logged in as. Session logs interleave rate-limit events from
+// other plans/accounts (a resumed pre-upgrade session replays them with fresh timestamps),
+// and only OUR plan's window governs OUR next call. Unknown -> null, and the selector then
+// declines to filter by plan rather than guessing.
+function codexAuthPlan() {
+  try {
+    const auth = JSON.parse(readFileSync(join(HOME, '.codex', 'auth.json'), 'utf8'));
+    return codexPlanFromIdToken(auth?.tokens?.id_token);
+  } catch { return null; }
+}
+
 function recentCodexSessionLines(windowMs = 12 * 3600_000) {
   const root = join(HOME, '.codex', 'sessions');
   if (!existsSync(root)) return [];
   const cutoff = Date.now() - windowMs;
   const files = [];
-  const walk = (dir) => { for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) walk(p);
-    else if (e.name.endsWith('.jsonl') && statSync(p).mtimeMs >= cutoff) files.push(p);
-  }};
-  try { walk(root); } catch { return []; }
+  const walk = (dir) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) { walk(p); continue; }
+      if (!e.name.endsWith('.jsonl')) continue;
+      try { if (statSync(p).mtimeMs >= cutoff) files.push(p); } catch { /* rotated away mid-walk */ }
+    }
+  };
+  walk(root);
   const out = [];
   for (const f of files) {
-    try { for (const l of readFileSync(f, 'utf8').split('\n')) if (l) out.push(l); } catch { /* skip */ }
+    try {
+      for (const l of readFileSync(f, 'utf8').split('\n')) {
+        if (l && looksLikeRateLimitLine(l)) out.push(l);
+      }
+    } catch { /* skip */ }
   }
   return out;
 }
@@ -85,7 +115,7 @@ async function claudeWindows(nowEpoch) {
 
 async function refresh() {
   const nowMs = Date.now(), nowEpoch = Math.floor(nowMs / 1000);
-  const codexRL = pickFreshestRateLimits(recentCodexSessionLines(), nowEpoch);
+  const codexRL = pickGoverningRateLimits(recentCodexSessionLines(), nowEpoch, { plan: codexAuthPlan() });
   const tlines = allTranscriptLines();
   const claudeSpend = sumClaudeTranscriptTokens(tlines, nowMs);
   const freshWin = await claudeWindows(nowEpoch);

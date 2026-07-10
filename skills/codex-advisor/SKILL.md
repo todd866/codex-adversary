@@ -37,11 +37,12 @@ printf '%s' "$DECISION_AND_CONTEXT" | ~/.claude/bin/codex-adversary.sh --mode ad
 ```
 
 Give it enough to be useful: what you're trying to do, the options you see, the constraints,
-and your current leaning. `advise` defaults to **`gpt-5.6-sol` at `--effort ultra`** (maximum
-reasoning with automatic subagent delegation) — the right tier for a consequential fork. Drop to
-`--effort max` for a hard but single-threaded decision, or `high` under budget pressure. Codex
-returns: the decision restated, the main options, tradeoffs, the risks you're likely missing,
-and a recommendation.
+and your current leaning. `advise` defaults to **`gpt-5.6-sol` at `--effort max`** — the
+deepest reasoning the server offers, and the right tier for a consequential fork. Drop to
+`high` under budget pressure. `--effort ultra` additionally lets Codex fan out to subagents;
+it is an opt-in, worth it only when the decision genuinely decomposes into parts that can be
+weighed independently. Codex returns: the decision restated, the main options, tradeoffs, the
+risks you're likely missing, and a recommendation.
 
 ## Using the advice (Claude has lead)
 

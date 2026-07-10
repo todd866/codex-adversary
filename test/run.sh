@@ -14,6 +14,7 @@ ok()  { PASS=$((PASS + 1)); printf '  ok   - %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL - %s\n' "$1"; }
 expect_exit() { if [ "$2" = "$3" ]; then ok "$1 (exit $3)"; else bad "$1 (expected $2, got $3)"; fi; }
 contains()    { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+not_contains(){ if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi; }
 
 # --- stub `codex`: captures the prompt it's handed; mode set via $STUB_MODE -------
 STUBDIR="$WORK/stubbin"; mkdir -p "$STUBDIR"
@@ -23,6 +24,17 @@ cat > "$STUBDIR/codex" <<'STUB'
 # wrapper wants); set it to fewer to simulate an older/newer Codex. STUB_MODE = ok|fail|empty|hang.
 case " $* " in
   *" --version "*) echo "codex-stub 0.0.0"; exit 0 ;;
+  # `codex features list -c features.multi_agent_v2=true` — the wrapper's ultra gate.
+  # STUB_V2 = true (default) | false | missing, to simulate a build that will enable
+  # multi_agent_v2, one that refuses to, and one that has dropped the feature entirely.
+  *" features "*)
+    echo "multi_agent                          stable             true"
+    case "${STUB_V2:-true}" in
+      true)  echo "multi_agent_v2                       under development  true" ;;
+      false) echo "multi_agent_v2                       under development  false" ;;
+      missing) : ;;
+    esac
+    exit 0 ;;
   *" --help "*)
     echo "Usage: codex exec [OPTIONS]"
     for f in ${STUB_FLAGS:---output-last-message --sandbox --ephemeral --ignore-rules --skip-git-repo-check -c -m -C}; do
@@ -144,7 +156,29 @@ for e in low medium high xhigh max ultra; do
   contains "$(cat "$AV")" "model_reasoning_effort=$e" "--effort $e reaches codex"
 done
 printf 'x' | "$WRAP" --mode prose --effort bogus >/dev/null 2>&1
-expect_exit "--effort bogus rejected (server enum has no such value)" 2 $?
+expect_exit "--effort bogus rejected (unknown values are forwarded verbatim and 400)" 2 $?
+
+echo "== the ultra gate: ultra means delegation, or it means nothing =="
+# `ultra` is the only CLI-side effort: the CLI maps Ultra->Max on the wire, and the sole
+# thing it adds is MultiAgentMode::Proactive — which requires the multi_agent_v2 feature.
+# With that feature off, ultra and max build byte-identical requests. So ultra must turn
+# the feature on for the invocation, or refuse. It must never silently mean max.
+printf 'x' | STUB_ARGV="$AV" STUB_V2=true "$WRAP" --mode prose --effort ultra >/dev/null 2>&1
+expect_exit "ultra accepted when multi_agent_v2 can be enabled" 0 $?
+contains "$(cat "$AV")" "features.multi_agent_v2=true" "ultra enables multi_agent_v2 for the invocation"
+contains "$(cat "$AV")" "model_reasoning_effort=ultra" "ultra still reaches codex as ultra"
+
+printf 'x' | STUB_ARGV="$AV" STUB_V2=true "$WRAP" --mode prose --effort max >/dev/null 2>&1
+not_contains "$(cat "$AV")" "features.multi_agent_v2" "max does NOT enable multi_agent_v2"
+
+: > "$AV"
+printf 'x' | STUB_ARGV="$AV" STUB_V2=false "$WRAP" --mode prose --effort ultra >/dev/null 2>&1
+expect_exit "ultra REFUSED (exit 6) when multi_agent_v2 is off — never silently downgraded" 6 $?
+not_contains "$(cat "$AV")" "model_reasoning_effort" "refused ultra never reaches codex exec"
+
+: > "$AV"
+printf 'x' | STUB_ARGV="$AV" STUB_V2=missing "$WRAP" --mode prose --effort ultra >/dev/null 2>&1
+expect_exit "ultra REFUSED (exit 6) when the feature no longer exists" 6 $?
 
 echo "== hermetic model: always pass -m explicitly =="
 # ~/.codex/config.toml is written concurrently by the ChatGPT.app Codex, so inheriting
@@ -155,10 +189,16 @@ printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode prose --effort low --model gpt-5.6-t
 contains "$(cat "$AV")" "-m gpt-5.6-terra" "--model overrides the default"
 
 echo "== per-mode effort defaults =="
+# `max` is the deepest SERVER effort and is exactly what ultra sent before the gate
+# existed. Proactive fan-out is an opt-in, not a silent default: it multiplies tokens
+# and engages an under-development orchestration layer.
 printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode prose >/dev/null 2>&1
-contains "$(cat "$AV")" "model_reasoning_effort=ultra" "prose defaults to ultra"
+contains "$(cat "$AV")" "model_reasoning_effort=max" "prose defaults to max"
+not_contains "$(cat "$AV")" "features.multi_agent_v2" "prose does not fan out by default"
 printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode advise >/dev/null 2>&1
-contains "$(cat "$AV")" "model_reasoning_effort=ultra" "advise defaults to ultra"
+contains "$(cat "$AV")" "model_reasoning_effort=max" "advise defaults to max"
+printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode verify --repo "$WORK" >/dev/null 2>&1
+contains "$(cat "$AV")" "model_reasoning_effort=high" "verify defaults to high (retrieval, not reasoning)"
 SR2="$WORK/scoutrepo2"; mkdir -p "$SR2"
 printf 'x' | STUB_ARGV="$AV" "$WRAP" --mode scout --repo "$SR2" >/dev/null 2>&1
 contains "$(cat "$AV")" "model_reasoning_effort=low" "scout defaults to low (cheap targeting is the mode's purpose)"
@@ -172,6 +212,28 @@ printf 'x' | "$WRAP" --mode prose --model gpt-5.6-luna --effort ultra >/dev/null
 expect_exit "luna + ultra rejected" 2 $?
 printf 'x' | "$WRAP" --mode prose --model gpt-5.6-luna --effort max >/dev/null 2>&1
 expect_exit "luna + max allowed (luna supports max)" 0 $?
+# bash `case` is case-sensitive; an uppercase slug used to sail straight past the guard
+# into the silent downgrade the guard exists to prevent.
+printf 'x' | "$WRAP" --mode prose --model gpt-5.6-LUNA --effort ultra >/dev/null 2>&1
+expect_exit "luna guard is case-insensitive (gpt-5.6-LUNA + ultra rejected)" 2 $?
+# Sol supports ultra, and 'luna' must not match as a substring of some other slug.
+printf 'x' | STUB_V2=true "$WRAP" --mode prose --model gpt-5.6-terra --effort ultra >/dev/null 2>&1
+expect_exit "terra + ultra allowed (terra supports ultra)" 0 $?
+
+echo
+# The budget library is tested with node's runner. run.sh used to skip it entirely, so a
+# green wrapper suite said nothing about ai-budget-lib.mjs. One command, one verdict.
+echo "== ai-budget library (node --test) =="
+if command -v node >/dev/null 2>&1; then
+  if node --test "$(dirname "$0")/ai-budget.test.mjs" >"$WORK/nodetest.out" 2>&1; then
+    ok "ai-budget.test.mjs: $(grep -E '^# pass' "$WORK/nodetest.out" | tr -dc '0-9') passing"
+  else
+    bad "ai-budget.test.mjs failed"
+    grep -E '^not ok' "$WORK/nodetest.out" | head -10
+  fi
+else
+  bad "node not found — ai-budget library untested"
+fi
 
 echo
 echo "passed: $PASS, failed: $FAIL"

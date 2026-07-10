@@ -54,10 +54,15 @@ Claude reconciles the two reviews rather than concatenating them:
 
 ### Per-pass reasoning effort
 
-Claude chooses Codex's effort by stakes. Defaults are per-mode (prose/diff/advise=`ultra`,
-judge=`xhigh`, scout=`low`) on `gpt-5.6-sol`; `max` is depth without fan-out, `ultra` for high-stakes
-or subtle artifacts (final pre-merge / pre-submission passes, statistical or security-
-sensitive material).
+Claude chooses Codex's effort by stakes. Defaults are per-mode on `gpt-5.6-sol`:
+prose/diff/advise=`max`, judge=`xhigh`, verify=`high`, scout=`low`.
+
+`max` is the deepest **server** reasoning tier — the right choice for a final pre-merge or
+pre-submission pass, or for statistical and security-sensitive material. `ultra` is a
+**CLI-side opt-in** that additionally permits Codex to fan out to concurrent subagents; take
+it only when the target genuinely decomposes. It requires the `multi_agent_v2` feature, which
+the wrapper enables per-invocation and **refuses (exit 6) rather than silently downgrade** if
+it cannot. Subagents inherit the read-only sandbox.
 
 ## The advisor role
 

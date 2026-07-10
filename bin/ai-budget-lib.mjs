@@ -42,33 +42,144 @@ export function parseCodexRateLimits(lines, nowEpoch) {
   return rateLimitsToWindows(rl, nowEpoch);
 }
 
-// Select the rate-limit snapshot from the newest EVENT, by the line's own timestamp.
+// Cheap pre-filter so callers can skip JSON.parse on the overwhelming majority of
+// session lines. Mirrors findRateLimits' two accepted shapes: a wrapper carrying
+// `rate_limits`, or the bare dict with `primary`/`secondary`.
+export function looksLikeRateLimitLine(line) {
+  return line.includes('rate_limits')
+    || (line.includes('"primary"') && line.includes('"secondary"'));
+}
+
+// Two window snapshots belong to the same rolling window instance if their `resets_at`
+// agree to within this much; concurrent writers report the same window a second or two apart.
+const WINDOW_JITTER_SEC = 120;
+
+// The plan the CLI is authenticated as, read from the id_token's claims. This is the
+// discriminator that makes rate-limit telemetry usable at all (see below). Returns null
+// on anything unexpected — callers must treat that as "unknown", never as a match.
+export function codexPlanFromIdToken(idToken) {
+  if (typeof idToken !== 'string') return null;
+  const part = idToken.split('.')[1];
+  if (!part) return null;
+  try {
+    const json = Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const claims = JSON.parse(json);
+    for (const v of Object.values(claims)) {
+      if (v && typeof v === 'object' && typeof v.chatgpt_plan_type === 'string') return v.chatgpt_plan_type;
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
+// Pick the rate-limit snapshot that GOVERNS the next CLI call.
 //
-// Codex sessions are written concurrently (the ChatGPT.app Codex and the CLI both
-// append under ~/.codex/sessions), and they report DIFFERENT window instances —
-// distinct `resets_at` for the same limit_id. Picking the newest session *file* and
-// taking its last line therefore reads whichever session happened to flush last, not
-// the window that actually governs the next call. On 2026-07-10 that reported
-// "17% left" while the 5h window governing CLI calls was 100% used.
+// Two earlier rules both failed, and it is worth recording why, because the obvious
+// approaches are the wrong ones:
 //
-// Lines that carry no parseable timestamp cannot be ordered; a timestamped event
-// always outranks them, and they fall back to last-wins only when nothing is timed.
-export function pickFreshestRateLimits(lines, nowEpoch) {
-  let freshest = null, freshestTs = -Infinity, lastUntimed = null;
+//   * "newest session FILE, last rate_limits line" — the ChatGPT.app Codex and the CLI
+//     both append under ~/.codex/sessions, so the newest file need not hold your reading.
+//   * "newest EVENT by `timestamp`" — `timestamp` is when the line was WRITTEN. A resumed
+//     or forked session REPLAYS historical rate_limit events stamped with the current time.
+//     Observed 2026-07-10: five snapshots of five different window instances, one plan,
+//     all written within 5ms. Newest-by-timestamp is a coin-flip among them.
+//
+// The logs interleave genuinely different limits, and mixing them is the whole bug:
+//   - `limit_id` distinguishes the general quota ("codex") from per-model quotas
+//     (e.g. "codex_bengalfox" = GPT-5.3-Codex-Spark), which are always ~0% and irrelevant.
+//   - `plan_type` distinguishes accounts/plans. A stale "prolite" window showing 100% used
+//     sits in the same directory as the live "pro" window showing 75%. Taking the minimum
+//     across plans reports 0% left while calls are served; taking the newest reports
+//     whatever flushed last. Only the plan the CLI is AUTHENTICATED as governs its calls.
+//   - `resets_at` distinguishes window instances. Within one plan, several coexist: the live
+//     one, an about-to-expire earlier one, and occasional lone outliers reporting a further
+//     reset with 0% used. Picking the FURTHEST reset lands on those outliers and reports a
+//     drained quota as empty. Picking the CONSENSUS window is correct: every active session
+//     re-reports the live window on every turn, so it dominates by count, while a replayed
+//     or spurious instance appears a handful of times.
+//
+// So: filter to our limit_id and our plan, bucket the surviving snapshots by window instance,
+// take the bucket the most snapshots agree on, and within it take the HIGHEST `used_percent`.
+// Within a fixed window `used_percent` only climbs, so the maximum is both the most recent
+// reading and the conservative one. Where the data cannot decide — a tie on votes, an event
+// that cannot be attributed to a plan — resolve PESSIMISTICALLY. Reporting less budget than
+// you have costs a cautious pass; reporting more sends a fan-out into a drained quota.
+//
+// Still advisory. The only certain check that budget remains is to make a cheap call.
+export function pickGoverningRateLimits(lines, nowEpoch, opts = {}) {
+  const { plan = null, limitId = 'codex', jitterSec = WINDOW_JITTER_SEC } = opts;
+
+  const parsed = [];
   for (const line of lines) {
+    if (!looksLikeRateLimitLine(line)) continue;
     let obj;
     try { obj = JSON.parse(line); } catch { continue; }
-    const found = findRateLimits(obj);
-    if (!found) continue;
-    const ts = Date.parse(obj?.timestamp ?? '');
-    if (Number.isFinite(ts)) {
-      if (ts >= freshestTs) { freshestTs = ts; freshest = found; }
-    } else {
-      lastUntimed = found;
-    }
+    const rl = findRateLimits(obj);
+    if (rl) parsed.push(rl);
   }
-  const chosen = freshest ?? lastUntimed;
-  return chosen ? rateLimitsToWindows(chosen, nowEpoch) : null;
+  if (!parsed.length) return null;
+
+  // An event with no `limit_id`/`plan_type` comes from an older Codex and cannot be
+  // ATTRIBUTED. Tolerating it is only safe when NOTHING is tagged (a wholly legacy log). As
+  // soon as any event is tagged, the untagged ones are legacy — plausibly from the plan the
+  // account has since left — and must not be allowed to out-vote an attributable reading.
+  const anyLimitTagged = parsed.some((rl) => typeof rl.limit_id === 'string');
+  const anyPlanTagged  = parsed.some((rl) => typeof rl.plan_type === 'string');
+  const pool = parsed.filter((rl) => {
+    if (limitId && anyLimitTagged && rl.limit_id !== limitId) return false;
+    if (plan && anyPlanTagged && rl.plan_type !== plan) return false;
+    return true;
+  });
+  if (!pool.length) return null;
+
+  // For one window ('primary' = 5h, 'secondary' = weekly): bucket unexpired snapshots into
+  // window instances, pick the instance the most snapshots agree on, then its worst reading.
+  const liveWindow = (key) => {
+    const wins = [];
+    for (const rl of pool) {
+      const win = rl[key];
+      if (!win || typeof win.resets_at !== 'number' || typeof win.used_percent !== 'number') continue;
+      if (win.resets_at <= nowEpoch) continue;   // already elapsed: not the live window
+      wins.push(win);
+    }
+    if (!wins.length) return null;
+
+    // Bucket sorted resets_at into window instances. Compare against each bucket's ANCHOR,
+    // not its last member: single-link chaining would fuse 20000,20120,20240,20360 into one
+    // bucket spanning 360s, manufacturing a plurality that outvotes the real window.
+    wins.sort((a, b) => a.resets_at - b.resets_at);
+    const buckets = [];
+    for (const win of wins) {
+      const last = buckets[buckets.length - 1];
+      if (last && win.resets_at - last.anchor <= jitterSec) {
+        last.n++;
+        last.maxReset = win.resets_at;
+        if (win.used_percent > last.worstUsed) last.worstUsed = win.used_percent;
+      } else {
+        buckets.push({ n: 1, anchor: win.resets_at, maxReset: win.resets_at, worstUsed: win.used_percent });
+      }
+    }
+    // Consensus: the instance the most snapshots agree on. On a tie there IS no consensus, so
+    // take the most pessimistic bucket. Never break ties toward the later reset — a lone
+    // outlier at a further reset reporting 0% used is exactly the shape that produces it.
+    let best = null;
+    for (const b of buckets) {
+      if (best === null || b.n > best.n || (b.n === best.n && b.worstUsed > best.worstUsed)) best = b;
+    }
+    return { rem: Math.round(100 - best.worstUsed), resetsAt: best.maxReset };
+  };
+
+  const p = liveWindow('primary');
+  const s = liveWindow('secondary');
+  if (!p && !s) return null;
+
+  const weeklyResetsAt = s ? s.resetsAt : null;
+  return {
+    fiveHourPct: p ? p.rem : null,
+    weeklyPct: s ? s.rem : null,
+    fiveHourResetsAt: p ? p.resetsAt : null,
+    weeklyResetsAt,
+    resetsAt: weeklyResetsAt,   // back-compat alias
+  };
 }
 
 export function sumClaudeTranscriptTokens(lines, nowMs) {
