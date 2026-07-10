@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { summariseCodexRateLimits, looksLikeRateLimitLine, parseCodexRetryAt, shouldProbeCodex,
          sumClaudeTranscriptTokens, parseClaudeUsageWindows, formatSnapshot, formatIfBelow,
@@ -109,19 +109,48 @@ async function claudeWindows(nowEpoch) {
 const PROBE_MODEL = process.env.CODEX_PROBE_MODEL || 'gpt-5.6-sol';
 const PROBE_TIMEOUT_MS = 30_000;
 
+// refresh() is run by launchd, whose PATH is /usr/bin:/bin:/usr/sbin:/sbin. `codex` lives in
+// an nvm bin dir, so a bare execFileSync('codex') throws ENOENT there and the probe reports
+// `unknown` forever — while working perfectly when a human tests it in a login shell. Resolve
+// the binary explicitly. `dirname(process.execPath)` is the nvm bin dir that holds both node
+// and codex, so it self-heals across nvm version bumps.
+function resolveCodexBin() {
+  const candidates = [
+    process.env.CODEX_BIN,
+    join(dirname(process.execPath), 'codex'),
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+    join(HOME, '.local', 'bin', 'codex'),
+    '/Applications/Codex.app/Contents/Resources/codex',
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { if (existsSync(c)) return c; } catch { /* keep looking */ }
+  }
+  return null;   // caller reports `unknown`, never `refusing`
+}
+
 // Ask Codex the only question its telemetry cannot answer: will you take a new turn?
 // One trivial request at the lowest effort. Distinguishes three outcomes, and NEVER reports a
 // crash, a timeout, or a missing binary as a refusal — that would stand an agent down on no
 // evidence, the exact failure this whole exercise was about.
 function probeCodex(nowMs) {
+  const bin = resolveCodexBin();
+  if (!bin) return { at: nowMs, status: 'unknown', model: PROBE_MODEL, retryAt: null, detail: 'codex-not-found' };
   let dir;
   try {
     dir = mkdtempSync(join(tmpdir(), 'codex-probe-'));
-    execFileSync('codex', [
+    // `codex` is a `#!/usr/bin/env node` shim, so resolving its path is not enough: under
+    // launchd's PATH the child cannot find `node` and dies with exit 127. Put node's own
+    // directory on the child's PATH.
+    const nodeDir = dirname(process.execPath);
+    execFileSync(bin, [
       'exec', '--sandbox', 'read-only', '--ephemeral', '--skip-git-repo-check',
       '-C', dir, '-m', PROBE_MODEL, '-c', 'model_reasoning_effort=low',
       'Reply with exactly: OK',
-    ], { stdio: ['ignore', 'pipe', 'pipe'], timeout: PROBE_TIMEOUT_MS, encoding: 'utf8' });
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'], timeout: PROBE_TIMEOUT_MS, encoding: 'utf8',
+      env: { ...process.env, PATH: `${nodeDir}:${process.env.PATH ?? ''}` },
+    });
     return { at: nowMs, status: 'serving', model: PROBE_MODEL, retryAt: null };
   } catch (e) {
     const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`;
