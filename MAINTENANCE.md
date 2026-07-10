@@ -65,33 +65,31 @@ Tested against **Codex CLI 0.144.1**. Run `codex-adversary.sh --doctor` to check
    `set -m` engaged and falls back to single-PID kill; with GNU `timeout`/`gtimeout` it uses
    `-k`. If a platform breaks this, the timeout still fires — just less thorough on
    grandchildren.
-8. **`rate_limits` telemetry shape changes.** `ai-budget` reads `~/.codex/sessions/**/*.jsonl`.
-   Three properties of that data are load-bearing and non-obvious; each has already produced a
-   wrong budget reading:
-   - **`timestamp` is when the line was WRITTEN, not when the reading was taken.** Resumed and
+8. **`rate_limits` telemetry.** `ai-budget` reads `~/.codex/sessions/**/*.jsonl`. **Do not try
+   to derive "budget remaining" from it.** Three rules have been tried and all three were wrong;
+   the data does not contain the answer. Before you attempt a fourth, read this:
+   - **`used_percent = 100` does not mean refused.** Measured 2026-07-10: the general
+     `codex`/`pro` 5h window read 100% used while Codex Desktop served 4,561 `gpt-5.6-sol`
+     requests in 15 minutes (zero `rate_limit_reached_type`), at the same moment a fresh
+     `codex exec` on that model was refused. Both were true simultaneously.
+   - **`plan_type` is not an identity.** The same client emits `pro` and `prolite` interleaved
+     — Codex Desktop produced thousands of each in six hours, and so did `codex_exec`. Do not
+     filter on it, and do not read the plan out of the `id_token` (which may be expired anyway).
+   - **`timestamp` is when the line was WRITTEN**, not when the reading was taken. Resumed and
      forked sessions replay historical snapshots with fresh timestamps. Never order by it.
-   - **The logs interleave different limits.** `limit_id` separates the general quota
-     (`codex`) from per-model quotas (`codex_bengalfox`); `plan_type` separates plans, and a
-     stale plan's exhausted window coexists with the live one. Only the plan in the
-     `id_token` governs your calls — hence `codexPlanFromIdToken`. If OpenAI moves that claim,
-     the function returns `null`, the plan filter is skipped, and readings get pessimistic
-     rather than wrong. Re-point it, don't remove it.
-   - **Several window instances are live at once per plan** (observed: `codex`/`pro` at
-     `used=29` and `used=100` simultaneously). Take the **binding** one — the highest
-     `used_percent` among unexpired instances. Any live window at 100% refuses the call,
-     however few snapshots name it. Do not select by consensus or by furthest reset; both
-     answer a question nobody asked, and both need machinery to avoid the optimistic failure.
-   - **`used_percent` never decreases within a session** (0 decreases / 37 sessions). There is
-     no reservation-and-refund scheme; usage accrues. If a future Codex *does* refund, the
-     `max()` would latch at the peak and under-report headroom for the rest of the window —
-     re-run the in-session monotonicity check before trusting it.
+   - **Several window instances are live at once**, with different `used_percent`; one session
+     alternated between `used=41` and `used=11` request by request.
+   - `limit_id` does separate the general quota (`codex`) from per-model quotas
+     (`codex_bengalfox` = *GPT-5.3-Codex-Spark*). That filter is the only one worth keeping.
 
-   The reported figure is the general `codex` limit, which gates `gpt-5.6-sol`. It does **not**
-   predict every model: Luna and `codex_bengalfox` (*GPT-5.3-Codex-Spark*) were both served
-   while that limit read 100% used — which is why Codex appears to "keep working after running
-   out". Treat the whole thing as advisory; the only certain check is a cheap call **with the
-   model you will actually run**:
-   `codex exec -m gpt-5.6-sol -c model_reasoning_effort=low ... "Reply: OK"`.
+   `summariseCodexRateLimits` therefore reports the **spread** across live windows, and the
+   glance renders it as `5h 0-100% left`. That looks uninformative because it *is* — which is
+   the honest state of this data. Nothing gates on it.
+
+   **The only reliable check is a cheap call with the model you will actually run:**
+   `codex exec -m gpt-5.6-sol -c model_reasoning_effort=low ... "Reply: OK"`. Luna and
+   `codex_bengalfox` were both served while the general limit read 100%, so a cheap-model probe
+   proves nothing about Sol.
 
 ## When you bump the supported Codex version
 

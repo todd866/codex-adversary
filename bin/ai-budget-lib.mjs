@@ -50,118 +50,78 @@ export function looksLikeRateLimitLine(line) {
     || (line.includes('"primary"') && line.includes('"secondary"'));
 }
 
-// The plan the CLI is authenticated as, read from the id_token's claims. This is the
-// discriminator that makes rate-limit telemetry usable at all (see below). Returns null
-// on anything unexpected — callers must treat that as "unknown", never as a match.
-export function codexPlanFromIdToken(idToken) {
-  if (typeof idToken !== 'string') return null;
-  const part = idToken.split('.')[1];
-  if (!part) return null;
-  try {
-    const json = Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-    const claims = JSON.parse(json);
-    for (const v of Object.values(claims)) {
-      if (v && typeof v === 'object' && typeof v.chatgpt_plan_type === 'string') return v.chatgpt_plan_type;
-    }
-  } catch { /* fall through */ }
-  return null;
-}
+// Summarise Codex's rate-limit telemetry. This function DOES NOT tell you whether a call will
+// be served, and no arrangement of this data can. Read that sentence again before "improving" it.
+//
+// What the logs actually contain, measured 2026-07-10:
+//   * `timestamp` is when the line was WRITTEN, not when the reading was taken. A resumed or
+//     forked session replays historical snapshots with fresh timestamps — five instances of
+//     five different windows, written within 5ms. Ordering by it is a coin-flip.
+//   * `limit_id` separates the general quota (`codex`) from per-model quotas
+//     (`codex_bengalfox` = GPT-5.3-Codex-Spark), which sit at ~0% used and are unrelated.
+//   * `plan_type` is NOT an account or an identity. The SAME client emits both values,
+//     interleaved: over six hours, Codex Desktop produced ~4.7k `pro` events and ~4.8k
+//     `prolite` events, and `codex_exec` produced both too. Filtering on the plan in the
+//     CLI's id_token is arbitrary — and that token had already expired.
+//   * Several window instances are live at once, with different `used_percent`. One session
+//     alternated between a window at `used=41` and one at `used=11`, request by request.
+//
+// And the fact that kills every point estimate: **`used_percent = 100` does not mean refused.**
+// While the general `codex`/`pro` window read 100% used, Codex Desktop served 4,561 model
+// requests in 15 minutes on `gpt-5.6-sol`, with zero `rate_limit_reached_type` set — at the same
+// time as a fresh `codex exec` on the same model was refused with "You've hit your usage limit".
+//
+// Three selection rules were tried and all were wrong: newest-file, newest-event, and
+// "the binding (most-used) window". The third was fitted to a single observed refusal and
+// "validated" against it. Do not add a fourth.
+//
+// So this reports the RANGE across live windows rather than inventing a governing one, and the
+// callers treat it as advisory. The only reliable check that Codex will serve you is to make a
+// cheap call with the model you intend to run and see whether it comes back.
+export function summariseCodexRateLimits(lines, nowEpoch, opts = {}) {
+  const { limitId = 'codex' } = opts;
 
-// Pick the rate-limit snapshot that GOVERNS the next CLI call.
-//
-// Two earlier rules both failed, and it is worth recording why, because the obvious
-// approaches are the wrong ones:
-//
-//   * "newest session FILE, last rate_limits line" — the ChatGPT.app Codex and the CLI
-//     both append under ~/.codex/sessions, so the newest file need not hold your reading.
-//   * "newest EVENT by `timestamp`" — `timestamp` is when the line was WRITTEN. A resumed
-//     or forked session REPLAYS historical rate_limit events stamped with the current time.
-//     Observed 2026-07-10: five snapshots of five different window instances, one plan,
-//     all written within 5ms. Newest-by-timestamp is a coin-flip among them.
-//
-// The logs interleave genuinely different limits, and mixing them is the whole bug:
-//   - `limit_id` distinguishes the general quota ("codex") from per-model quotas
-//     (e.g. "codex_bengalfox" = GPT-5.3-Codex-Spark), which are always ~0% and irrelevant.
-//   - `plan_type` distinguishes accounts/plans. A stale "prolite" window showing 100% used
-//     sits in the same directory as the live "pro" window showing 75%. Taking the minimum
-//     across plans reports 0% left while calls are served; taking the newest reports
-//     whatever flushed last. Only the plan the CLI is AUTHENTICATED as governs its calls.
-//   - `resets_at` distinguishes window instances, and SEVERAL are live at once for one plan.
-//     Observed 2026-07-10: `codex`/`pro` carried a window at `used=29` and another at
-//     `used=100` simultaneously, each re-reported by the same 15 sessions.
-//
-// Given several live windows, the question is not "which one do most sessions mention" — it is
-// "which one BLOCKS the next call". Any live window at 100% refuses it, however few snapshots
-// name it. So after attribution we take the BINDING window: the highest `used_percent` among
-// unexpired instances. Within a fixed window `used_percent` only climbs and never refunds
-// (verified: zero in-session decreases across 37 sessions), so the maximum is simultaneously
-// the latest reading and the conservative one.
-//
-// This subsumes the outlier problem rather than solving it: a spurious instance reporting a
-// further-forward reset at 0% used is the most generous reading, so a minimum ignores it for
-// free. An earlier attempt selected a window by consensus and then had to defend that choice
-// against ties, chained buckets, and unattributable votes — scaffolding for a question that
-// did not need asking. The one thing the minimum genuinely needs is the attribution filter
-// above; without it, it latches onto a retired plan's exhausted window and reports 0% while
-// calls are being served.
-//
-// Residual, stated honestly: nothing in the payload attributes a window instance to a MODEL,
-// so when two live windows disagree we report the stricter. That errs toward caution — the
-// safe direction — and can under-report headroom for a cheaper model.
-//
-// Still advisory. The only certain check that budget remains is a cheap call with the model
-// you actually intend to run.
-export function pickGoverningRateLimits(lines, nowEpoch, opts = {}) {
-  const { plan = null, limitId = 'codex' } = opts;
-
-  const parsed = [];
+  const pool = [];
   for (const line of lines) {
     if (!looksLikeRateLimitLine(line)) continue;
     let obj;
     try { obj = JSON.parse(line); } catch { continue; }
     const rl = findRateLimits(obj);
-    if (rl) parsed.push(rl);
+    if (!rl) continue;
+    // Per-model quotas answer a different question; everything else counts, whatever its plan.
+    if (limitId && typeof rl.limit_id === 'string' && rl.limit_id !== limitId) continue;
+    pool.push(rl);
   }
-  if (!parsed.length) return null;
-
-  // An event with no `limit_id`/`plan_type` comes from an older Codex and cannot be
-  // ATTRIBUTED. Tolerating it is only safe when NOTHING is tagged (a wholly legacy log). As
-  // soon as any event is tagged, the untagged ones are legacy — plausibly from the plan the
-  // account has since left — and must not be allowed to out-vote an attributable reading.
-  const anyLimitTagged = parsed.some((rl) => typeof rl.limit_id === 'string');
-  const anyPlanTagged  = parsed.some((rl) => typeof rl.plan_type === 'string');
-  const pool = parsed.filter((rl) => {
-    if (limitId && anyLimitTagged && rl.limit_id !== limitId) return false;
-    if (plan && anyPlanTagged && rl.plan_type !== plan) return false;
-    return true;
-  });
   if (!pool.length) return null;
 
-  // For one window ('primary' = 5h, 'secondary' = weekly): among unexpired instances, the one
-  // that binds is the most-used one. A window that has already reset cannot block anything.
-  const bindingWindow = (key) => {
-    let worst = null;
+  // Collect every live (unexpired) instance of one window. Report the spread, not a winner.
+  const spread = (key) => {
+    let min = null, max = null, minReset = null, n = 0;
     for (const rl of pool) {
       const win = rl[key];
-      if (!win || typeof win.resets_at !== 'number' || typeof win.used_percent !== 'number') continue;
-      if (win.resets_at <= nowEpoch) continue;   // already elapsed
-      if (worst === null || win.used_percent > worst.used_percent) worst = win;
+      if (!win || typeof win.used_percent !== 'number') continue;
+      if (typeof win.resets_at === 'number' && win.resets_at > 0 && win.resets_at <= nowEpoch) continue;
+      const rem = Math.round(100 - win.used_percent);
+      n++;
+      if (min === null || rem < min) { min = rem; minReset = win.resets_at ?? null; }
+      if (max === null || rem > max) max = rem;
     }
-    if (!worst) return null;
-    return { rem: Math.round(100 - worst.used_percent), resetsAt: worst.resets_at };
+    return n ? { min, max, resetsAt: minReset } : null;
   };
 
-  const p = bindingWindow('primary');
-  const s = bindingWindow('secondary');
+  const p = spread('primary');
+  const s = spread('secondary');
   if (!p && !s) return null;
 
-  const weeklyResetsAt = s ? s.resetsAt : null;
   return {
-    fiveHourPct: p ? p.rem : null,
-    weeklyPct: s ? s.rem : null,
+    // `fiveHourPct` / `weeklyPct` keep the strictest reading so nothing downstream reads high.
+    fiveHourPct: p ? p.min : null,
+    fiveHourPctMax: p ? p.max : null,
+    weeklyPct: s ? s.min : null,
+    weeklyPctMax: s ? s.max : null,
     fiveHourResetsAt: p ? p.resetsAt : null,
-    weeklyResetsAt,
-    resetsAt: weeklyResetsAt,   // back-compat alias
+    weeklyResetsAt: s ? s.resetsAt : null,
+    resetsAt: s ? s.resetsAt : null,   // back-compat alias
   };
 }
 
@@ -237,13 +197,24 @@ export function lowestPct(state) {
   return xs.length ? Math.min(...xs) : null;
 }
 
+// Codex reports several live windows that disagree, so a single number would be a fiction.
+// Render the spread when they differ: "5h 0-71% left". A reader who sees a range knows not to
+// treat it as a gate; a reader who sees "0%" concludes Codex is down, and is wrong.
+function windowStr(min, max) {
+  if (min == null) return pctLeft(min);
+  if (max == null || max === min) return pctLeft(min);
+  return `${min}-${max}% left`;
+}
+
 function providerLine(name, p, weeklyCritical = false) {
   if (!p) return `${name.padEnd(6)} n/a`;
   const mark = weeklyCritical ? ' ⚠' : '';
   const used = (p.spentToday == null && p.spent7d == null)
     ? 'used n/a'
     : `used ${fmtTok(p.spentToday)} today / ${fmtTok(p.spent7d)} 7d`;
-  return `${name.padEnd(6)} 5h ${pctLeft(p.fiveHourPct)} · week ${pctLeft(p.weeklyPct)}${mark} · ${used}`;
+  const five = windowStr(p.fiveHourPct, p.fiveHourPctMax);
+  const week = windowStr(p.weeklyPct, p.weeklyPctMax);
+  return `${name.padEnd(6)} 5h ${five} · week ${week}${mark} · ${used}`;
 }
 
 export function formatSnapshot(state, nowMs) {

@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.7.2 — 2026-07-10
+
+**Retracts the budget-window selection rule in v0.7.1. There is no governing window, and no
+arrangement of this telemetry predicts whether a call will be served.**
+
+The measurement that settles it: while the general `codex`/`pro` 5h window read `used_percent
+= 100`, Codex Desktop served **4,561 `gpt-5.6-sol` requests in 15 minutes** with zero
+`rate_limit_reached_type` set — at the same moment a fresh `codex exec` on that same model was
+refused with *"You've hit your usage limit."* **`used = 100` does not mean refused.**
+
+Two further premises of v0.7.1 were false:
+- **`plan_type` is not an account or an identity.** The same client emits both values,
+  interleaved: over six hours Codex Desktop produced ~4.7k `pro` and ~4.8k `prolite` events,
+  and `codex_exec` produced both. `prolite` was never "a retired plan". Filtering on the plan
+  in the CLI's `id_token` discarded half the data on the basis of a claim in a token that had
+  **expired three days earlier**. `codexPlanFromIdToken` is removed.
+- **"The binding window blocks the call"** was fitted to a single observed refusal and then
+  validated against that same refusal. Three selection rules have now been tried — newest-file,
+  newest-event, binding-minimum — and all three were wrong. There is no fourth.
+
+`pickGoverningRateLimits` → `summariseCodexRateLimits`, which reports the **range** across live
+windows instead of inventing a winner, and the glance renders it as a spread (`5h 0-100% left`).
+A range is uninformative by construction, which is the honest state of this data; a point
+estimate reads as authoritative and is not. Nothing gates on the 5h figure.
+
+As the project's own telemetry note said before any of this was built: *treat `rate_limits` as
+advisory, not a budget oracle; the only reliable check that budget remains is to make a cheap
+call — with the model you intend to run — and see whether it is served.*
+
 ## v0.7.1 — 2026-07-10
 
 **Corrects two claims v0.7.0 got wrong, and makes `ultra` mean something.** Verified against
